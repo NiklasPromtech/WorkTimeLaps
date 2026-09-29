@@ -22,6 +22,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var statusLine: NSMenuItem!
     private var detailLine: NSMenuItem!
     private var permissionItem: NSMenuItem!
+    private var relaunchItem: NSMenuItem!
     private var startStopItem: NSMenuItem!
     private var pauseItem: NSMenuItem!
     private var resumeItem: NSMenuItem!
@@ -32,9 +33,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var isStarting = false
     private var isTerminationPending = false
 
-    /// Set when an automatic start failed for lack of Screen Recording
-    /// permission; the menu then offers to fix it instead of nagging.
+    /// Set when a start failed for lack of Screen Recording permission;
+    /// the menu then offers to fix it instead of nagging.
     private var needsScreenPermission = false
+
+    /// Polls for the permission while it's missing, so recording starts as
+    /// soon as it's granted.
+    private var permissionWatcher: Timer?
+    private var lastPreflight = false
 
     private var observers: [NSObjectProtocol] = []
 
@@ -85,6 +91,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         permissionItem.target = self
         permissionItem.isHidden = true
         menu.addItem(permissionItem)
+
+        relaunchItem = NSMenuItem(title: "Quit & Reopen WorkTimeLaps", action: #selector(relaunch), keyEquivalent: "")
+        relaunchItem.target = self
+        relaunchItem.isHidden = true
+        menu.addItem(relaunchItem)
 
         menu.addItem(.separator())
 
@@ -182,6 +193,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
 
         permissionItem.isHidden = !needsScreenPermission || recorder.isRecording
+        relaunchItem.isHidden = permissionItem.isHidden
 
         startStopItem.title = recorder.isRecording ? "Stop Recording" : "Start Recording"
         startStopItem.isEnabled = !isStarting && !isFinalizing
@@ -254,8 +266,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             do {
                 try await recorder.start()
                 needsScreenPermission = false
+                stopWatchingForPermission()
             } catch let error as TimeLapseRecorder.RecorderError where error.isPermissionProblem {
                 needsScreenPermission = true
+                watchForPermission()
                 if userInitiated { presentPermissionAlert() }
             } catch {
                 if userInitiated { presentError(error) }
@@ -280,6 +294,38 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
         }
+    }
+
+    /// While access is missing, checks every few seconds whether it has
+    /// been granted and starts recording as soon as it is.
+    private func watchForPermission() {
+        guard permissionWatcher == nil else { return }
+        lastPreflight = ScreenAccess.isGranted
+        let timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkPermission() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        permissionWatcher = timer
+    }
+
+    private func checkPermission() {
+        guard needsScreenPermission, !recorder.isRecording else {
+            stopWatchingForPermission()
+            return
+        }
+        guard !isStarting else { return }
+        let granted = ScreenAccess.isGranted
+        // Retry only when access newly appears. If macOS already reported it
+        // as granted and capture still failed, only a relaunch will help.
+        if granted && !lastPreflight {
+            startRecording(userInitiated: false)
+        }
+        lastPreflight = granted
+    }
+
+    private func stopWatchingForPermission() {
+        permissionWatcher?.invalidate()
+        permissionWatcher = nil
     }
 
     /// Called by AppDelegate when the app is asked to quit. Returns false if
@@ -320,7 +366,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func grantScreenAccess() {
-        ScreenAccess.request()
+        presentPermissionAlert()
+    }
+
+    @objc private func relaunch() {
+        ScreenAccess.relaunch()
     }
 
     @objc private func openDiary() {
@@ -348,13 +398,26 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func presentPermissionAlert() {
         let alert = NSAlert()
         alert.messageText = "WorkTimeLaps needs Screen Recording access"
-        alert.informativeText = "Turn on WorkTimeLaps in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen WorkTimeLaps."
+        alert.informativeText = """
+        Turn on WorkTimeLaps in System Settings → Privacy & Security → Screen & System Audio \
+        Recording. Recording starts by itself once access is granted; if it doesn't, choose \
+        Quit & Reopen.
+
+        Already switched on? Then macOS is holding the permission for an earlier build of the \
+        app. Select WorkTimeLaps in that list, remove it with the – button, and grant access again.
+        """
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Quit & Reopen")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
             ScreenAccess.request()
+        case .alertSecondButtonReturn:
+            ScreenAccess.relaunch()
+        default:
+            break
         }
     }
 
@@ -382,5 +445,22 @@ enum ScreenAccess {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Quits and reopens the app. A running app doesn't always pick up a new
+    /// Screen Recording grant until it restarts.
+    static func relaunch() {
+        let reopen = Process()
+        reopen.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Wait for this process to exit, then open the bundle again.
+        reopen.arguments = ["-c", "while /bin/kill -0 \"$2\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$1\"",
+                            "sh", Bundle.main.bundlePath, String(ProcessInfo.processInfo.processIdentifier)]
+        do {
+            try reopen.run()
+        } catch {
+            NSLog("WorkTimeLaps: couldn't schedule relaunch: \(error.localizedDescription)")
+            return
+        }
+        NSApp.terminate(nil)
     }
 }

@@ -55,6 +55,8 @@ final class TimeLapseRecorder {
 
     enum RecorderError: LocalizedError {
         case alreadyRecording
+        /// macOS refused Screen Recording access to this build of the app.
+        case permissionDenied
         case screenUnavailable(underlying: String?)
         case writerFailed(String)
 
@@ -62,8 +64,10 @@ final class TimeLapseRecorder {
             switch self {
             case .alreadyRecording:
                 return "A recording is already in progress."
+            case .permissionDenied:
+                return "WorkTimeLaps doesn't have Screen Recording access."
             case .screenUnavailable(let underlying):
-                let base = "Couldn't capture the screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch WorkTimeLaps."
+                let base = "Couldn't capture the screen."
                 if let u = underlying { return "\(base)\n\n(\(u))" }
                 return base
             case .writerFailed(let msg):
@@ -73,9 +77,22 @@ final class TimeLapseRecorder {
 
         /// True when the fix is granting Screen Recording permission.
         var isPermissionProblem: Bool {
-            if case .screenUnavailable = self { return true }
+            if case .permissionDenied = self { return true }
             return false
         }
+    }
+
+    /// Screen Recording denials surface as ScreenCaptureKit's "user
+    /// declined" error; anything else is a genuine capture failure.
+    private static func captureError(_ error: Error) -> RecorderError {
+        NSLog("WorkTimeLaps: screen capture unavailable: \(error.localizedDescription)")
+        if let scError = error as? SCStreamError, scError.code == .userDeclined {
+            return .permissionDenied
+        }
+        if !CGPreflightScreenCaptureAccess() {
+            return .permissionDenied
+        }
+        return .screenUnavailable(underlying: error.localizedDescription)
     }
 
     /// Why nothing is being captured while recording is on.
@@ -289,7 +306,7 @@ final class TimeLapseRecorder {
         do {
             content = try await SCShareableContent.current
         } catch {
-            throw RecorderError.screenUnavailable(underlying: error.localizedDescription)
+            throw Self.captureError(error)
         }
         guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
                 ?? content.displays.first else {
@@ -308,7 +325,7 @@ final class TimeLapseRecorder {
         do {
             _ = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         } catch {
-            throw RecorderError.screenUnavailable(underlying: error.localizedDescription)
+            throw Self.captureError(error)
         }
 
         captureFilter = filter

@@ -6,8 +6,9 @@ import Security
 /// Earlier versions kept the key in plaintext UserDefaults; it's moved to
 /// the keychain (and deleted from preferences) the first time it's read.
 ///
-/// Because builds are ad-hoc signed, macOS may ask once after each rebuild
-/// whether WorkTimeLaps may read its keychain item — choose "Always Allow".
+/// The item's access list is tied to the app's signing identity. Builds
+/// signed ad hoc look like a new app each time, so macOS asks once after a
+/// rebuild whether WorkTimeLaps may read it — choose "Always Allow".
 @MainActor
 enum APIKeyStore {
 

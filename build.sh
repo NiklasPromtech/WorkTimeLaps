@@ -51,11 +51,37 @@ cp Resources/AppIcon.icns "$RESOURCES_DIR/AppIcon.icns"
 echo "▶ Writing PkgInfo…"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
-# Ad-hoc code-sign the app so macOS is more likely to remember the Screen
-# Recording permission across rebuilds (an unsigned binary gets a new
-# “identity” each build and re-prompts).
-echo "▶ Ad-hoc code-signing…"
-codesign --force --sign - "$BUNDLE_DIR"
+# Code signing. macOS ties privacy permissions (Screen Recording) and the
+# keychain item's access list to the app's signing identity. With a real
+# certificate — a free Apple Development one from Xcode will do — they
+# survive rebuilds. Signed ad hoc, every rebuild looks like a new app.
+#
+#   CODESIGN_IDENTITY="Apple Development: …" ./build.sh   use this identity
+#   CODESIGN_IDENTITY=- ./build.sh                        force ad-hoc signing
+#
+# By default the first Apple Development or Developer ID Application
+# identity in your keychain is used, if there is one.
+IDENTITY="${CODESIGN_IDENTITY:-}"
+IDENTITY_NAME="$IDENTITY"
+if [ -z "$IDENTITY" ]; then
+    FOUND="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -E '"(Apple Development|Developer ID Application): ' | head -1 || true)"
+    if [ -n "$FOUND" ]; then
+        IDENTITY="$(echo "$FOUND" | awk '{print $2}')"
+        IDENTITY_NAME="$(echo "$FOUND" | sed -E 's/^[^"]*"(.*)"$/\1/')"
+    fi
+fi
+
+if [ -z "$IDENTITY" ] || [ "$IDENTITY" = "-" ]; then
+    echo "▶ Code-signing ad hoc (no signing certificate found)…"
+    codesign --force --sign - "$BUNDLE_DIR"
+    echo "  Note: macOS ties Screen Recording access to this exact build. After a"
+    echo "  rebuild, remove WorkTimeLaps under System Settings → Privacy & Security →"
+    echo "  Screen & System Audio Recording (–) and grant access again."
+else
+    echo "▶ Code-signing as $IDENTITY_NAME…"
+    codesign --force --sign "$IDENTITY" "$BUNDLE_DIR"
+fi
 
 echo ""
 echo "✅ Built $BUNDLE_DIR"

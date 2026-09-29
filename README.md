@@ -78,12 +78,14 @@ open /Applications/WorkTimeLaps.app
 
 On first launch a welcome window walks you through the API key, Screen Recording access and the login item. Recording starts when you click **Start Recording**.
 
-**Things macOS will ask about.** The app is ad-hoc signed rather than notarized, so:
+**Signing and permissions.** macOS ties Screen Recording access, and access to the app's keychain item, to the app's signing identity. `build.sh` signs with your Apple Development certificate when you have one (Xcode creates one for free when you add an Apple ID under Settings → Accounts), so permissions survive rebuilds. Without one it signs ad hoc, and every rebuild looks like a new app to macOS:
 
-- The first launch may be blocked. Open **System Settings → Privacy & Security** and click **Open Anyway**.
-- Screen Recording access is granted in **System Settings → Privacy & Security → Screen & System Audio Recording**. Quit and reopen WorkTimeLaps afterwards. After each rebuild macOS may treat it as a new app and ask again; `tccutil reset ScreenCapture com.niklas.worktimelaps` clears a stuck entry.
-- After a rebuild, macOS may ask whether WorkTimeLaps can read its keychain item. Choose **Always Allow**.
-- macOS periodically re-confirms that you still want to allow screen recording.
+- The old Screen Recording entry stays switched on but no longer applies. Select WorkTimeLaps in **System Settings → Privacy & Security → Screen & System Audio Recording**, remove it with **–**, and grant access again (or run `tccutil reset ScreenCapture com.niklas.worktimelaps`).
+- macOS may ask whether WorkTimeLaps can read its keychain item. Choose **Always Allow**.
+
+To pick a specific identity, run `CODESIGN_IDENTITY="Apple Development: …" ./build.sh`; `CODESIGN_IDENTITY=- ./build.sh` forces ad-hoc signing.
+
+Once access is granted, recording starts on its own; if it doesn't, choose **Quit & Reopen WorkTimeLaps** from the menu. macOS also re-confirms from time to time that you still want to allow screen recording.
 
 ## Using it
 
@@ -162,7 +164,7 @@ Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.
 ## Limitations
 
 - Records the main display only.
-- Ad-hoc signed, not notarized — see the permission notes above.
+- Built from source and not notarized — see the signing notes above.
 - Frame labels come from a model looking at screenshots, so they're sometimes vague or wrong. The diary is told to trust patterns over single frames, but read it as a draft of your day, not a record.
 
 ## License

@@ -138,9 +138,10 @@ struct WelcomeView: View {
                         .font(.system(.headline, design: .rounded))
                     Text(model.hasScreenAccess
                          ? "Granted."
-                         : "Turn on WorkTimeLaps in System Settings, then quit and reopen the app.")
+                         : "Turn on WorkTimeLaps in System Settings. Already on? Remove it with – and grant again: macOS ties the permission to one specific build.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
                 if !model.hasScreenAccess {
