@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Build output (produced by ./build.sh)
+WorkTimeLaps.app/
+.build/
+build/
+
+# Xcode, if you open the sources in an Xcode project
+xcuserdata/
+DerivedData/
