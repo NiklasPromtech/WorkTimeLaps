@@ -31,6 +31,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>WorkTimeLaps takes a screenshot every 10 seconds while recording to build a time-lapse of your work day and write your daily work diary.</string>
+    <string>WorkTimeLaps takes a screenshot every minute while recording to build a time-lapse of your work day and write your daily work diary.</string>
 </dict>
 </plist>

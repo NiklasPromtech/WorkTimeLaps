@@ -48,6 +48,26 @@ enum DiaryTests {
             expect(DiaryComposer.material(for: "2026-09-28") == nil)
         }
 
+        test("a day mixing 10-second and one-minute sessions counts time correctly") {
+            resetDataDir()
+            // 30 minutes at 10 s, then an hour at one a minute.
+            writeSession(id: "TimeLapse_fast", frames: frames(from: date(2026, 9, 29, 9), count: 180, interval: 10))
+            var slow = RecordingSession(
+                id: "TimeLapse_slow", video: "TimeLapse_slow.mp4", startedAt: date(2026, 9, 29, 10), endedAt: nil,
+                lastUpdated: date(2026, 9, 29, 11), captureIntervalSec: 60, playbackFPS: 10,
+                display: .init(width: 10, height: 10),
+                frames: frames(from: date(2026, 9, 29, 10), count: 60, interval: 60, firstIndex: 0), summary: nil)
+            slow.endedAt = date(2026, 9, 29, 11)
+            slow.summary = SessionSummary.make(frames: slow.frames, captureInterval: 60)
+            try SessionWriter.write(slow, to: dataDir.appendingPathComponent("TimeLapse_slow.json"))
+            Journal.append(session: slow)
+
+            guard let m = DiaryComposer.material(for: "2026-09-29") else { return fail("no material") }
+            // 1h 30m, give or take one interval where the two sessions meet.
+            expect(abs(m.stats.activeSeconds - 5400) <= 60, "active \(m.stats.activeSeconds)")
+            expectEqual(slow.summary?.activeSeconds, 3600)
+        }
+
         test("the prompt carries stats, a condensed timeline, praise and notes") {
             seedDay()
             let prompt = DiaryComposer.promptText(for: DiaryComposer.material(for: "2026-09-29")!)

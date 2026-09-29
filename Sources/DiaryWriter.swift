@@ -110,7 +110,7 @@ struct DiaryWriter: Sendable {
     }
 
     static let systemPrompt = """
-    You write a short, honest work diary entry for one person, in their voice, from an automatic log of their screen activity. The log comes from WorkTimeLaps, a macOS app that labels a screenshot every 10 seconds; you never see the screenshots themselves.
+    You write a short, honest work diary entry for one person, in their voice, from an automatic log of their screen activity. The log comes from WorkTimeLaps, a macOS app that periodically labels a screenshot of their screen; you never see the screenshots themselves.
 
     Voice: first person, past tense, plain and warm, like a thoughtful person's own end-of-day notes. No hype, no productivity-coach tone, no emoji, no headings inside the text.
 

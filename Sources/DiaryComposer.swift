@@ -31,11 +31,14 @@ enum DiaryComposer {
 
         let sessions = log.sessions.sorted { $0.startedAt < $1.startedAt }
         var frames: [FrameEntry] = []
-        var captureInterval: TimeInterval = 10
+        // A day can mix intervals (the setting changed mid-day). Time is
+        // counted from the gaps between frames, so the longest interval is
+        // the safe one to use for the whole day.
+        var captureInterval: TimeInterval = 0
         for digest in sessions {
             if let full = try? SessionWriter.read(from: Journal.sidecarURL(for: digest)) {
                 frames.append(contentsOf: full.frames)
-                captureInterval = full.captureIntervalSec
+                captureInterval = max(captureInterval, full.captureIntervalSec)
             }
         }
         frames.sort { $0.t < $1.t }

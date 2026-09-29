@@ -18,7 +18,7 @@
   <img src="docs/diary.jpg" width="820" alt="A diary page: headline, a short first-person entry, highlights, where the time went, a timeline, kind words and loose ends">
 </p>
 
-WorkTimeLaps takes a screenshot every 10 seconds while you work. Claude labels each one — what app, what task, how focused — and the frames become a video you can scrub through. After each work day ends, Claude turns the day's activity log into a short diary entry, and at 9:00 the next morning a notification tells you it's ready.
+WorkTimeLaps takes a screenshot every minute while you work. Claude labels each one — what app, what task, how focused — and the frames become a video you can scrub through. After each work day ends, Claude turns the day's activity log into a short diary entry, and at 9:00 the next morning a notification tells you it's ready.
 
 It's built for the question you can never answer on a Friday afternoon, or at review time: *what did I actually do?*
 
@@ -27,7 +27,7 @@ It's built for the question you can never answer on a Friday afternoon, or at re
 - **Work Diary.** A page for every day you worked: a headline, a short first-person account, highlights, a timeline, where the time went, praise you received, and loose ends to pick up. Written by Claude from the day's text log (never from screenshots), or assembled locally if you'd rather not use the API for it. Every entry is also saved as Markdown.
 - **Always on, but not always recording.** Opens at login and starts recording by itself. Pauses automatically while your screen is locked, the display or Mac is asleep, or you pause it from the menu (15 minutes, an hour, or until tomorrow).
 - **Work days that match how you work.** A day runs from 02:00 to 02:00 by default, so a late night counts toward the day it started. The cutoff is configurable.
-- **Time-lapse video.** An hour of work becomes about 36 seconds of video. Videos are kept for 48 hours by default, then deleted automatically — the text log, journal, diaries and highlights are kept.
+- **Time-lapse video.** A whole work day plays back in under a minute. Screenshots are taken once a minute by default (10 seconds to 2 minutes in Settings). Videos are kept for 48 hours, then deleted automatically — the text log, journal, diaries and highlights are kept.
 - **Journal.** A week view of time worked per day, and per-session playback with an engagement curve, a category breakdown and a live activity stream.
 - **Highlights.** Specific praise from colleagues and clients ("the analysis you ran saved us a week") is picked up from Slack, email and PR comments and kept for your next review. A strict rubric keeps routine "thanks!" out.
 - **Privacy controls.** Block apps and window titles outright, redact financial, medical, HR/legal and personal-message content from the video, and redact any frame that shows a password, API key or other secret.
@@ -42,7 +42,7 @@ WorkTimeLaps has no server and no telemetry. The only network requests it makes 
 
 | What | Sent to | When |
 |---|---|---|
-| Each screenshot, downscaled to 1568 px and JPEG-compressed | Claude Haiku 4.5 | Every 10 s while recording — **except** frames of blocked apps and windows, WorkTimeLaps' own windows, and anything captured while paused or locked |
+| Each screenshot, downscaled to 1568 px and JPEG-compressed | Claude Haiku 4.5 | Once a minute while recording (configurable) — **except** frames of blocked apps and windows, WorkTimeLaps' own windows, and anything captured while paused or locked |
 | The day's text log: activity labels, one-line summaries, times, praise quotes and your session notes | Claude Opus 5.5 | Once per work day, to write the diary |
 
 Worth knowing:
@@ -60,7 +60,8 @@ You pay Anthropic directly for API usage. Estimates at current list prices:
 | | Tokens per call | Cost |
 |---|---|---|
 | One screenshot (Claude Haiku 4.5, $1 / $5 per million input / output tokens) | ~1,600 image + ~2,300 prompt in, ~150 out | ~$0.004–0.005 |
-| An 8-hour day (≈ 2,900 screenshots) | | **~$10–13** |
+| An 8-hour day at one screenshot a minute (480 screenshots) | | **~$2** |
+| An 8-hour day at one every 10 seconds (2,880 screenshots) | | ~$13 |
 | One diary entry (Claude Opus 5.5, $4 / $20 per million) | ~5–10k in, ~2–4k out | ~$0.10 |
 
 Idle time is cheaper than it looks: nothing is sent while the screen is locked or the Mac sleeps, and blocked apps are never sent. Check the [Anthropic Console](https://console.anthropic.com/) for your actual usage.
@@ -101,7 +102,7 @@ The ◉ icon in the menu bar fills in while recording, with a live engagement nu
 - **Latest Diary…** (⌘D) opens the Diary on the most recent finished day. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.
 - **Journal…** (⌘J) shows the week, each day's sessions, and per-session playback.
 - **Highlights…** (⌘H) collects the praise you've received over 7, 30 or 90 days, or the year.
-- **Settings…** (⌘,) has the login item, video retention, the day cutoff, the diary notification time, the API key, privacy filters and the block list.
+- **Settings…** (⌘,) has the login item, how often to take a screenshot, video retention, the day cutoff, the diary notification time, the API key, privacy filters and the block list.
 
 ## Where things are stored
 
@@ -125,7 +126,7 @@ One session is recorded per work day (a new one starts at the cutoff, or wheneve
 
 ## How it works
 
-Every 10 seconds the recorder checks the front app and window against the block list. Anything else is sent to Claude Haiku in a single call that returns a JSON verdict: whether a secret is visible, a category (coding, writing, email, chat, meeting, browsing, design, terminal, reading, media, other), a specific activity label ("Stripe pricing config", reused across frames through a rolling vocabulary so the stream clusters cleanly), a one-line summary, an engagement score, a privacy tag, and — only when the rubric's bar is met — a quote of praise addressed to you. The frame, or a REDACTED placeholder, is appended to the day's H.264 video; the verdict goes into the frame log. If the call fails, the frame is redacted (fail-closed).
+Once a minute (by default) the recorder checks the front app and window against the block list. Anything else is sent to Claude Haiku in a single call that returns a JSON verdict: whether a secret is visible, a category (coding, writing, email, chat, meeting, browsing, design, terminal, reading, media, other), a specific activity label ("Stripe pricing config", reused across frames through a rolling vocabulary so the stream clusters cleanly), a one-line summary, an engagement score, a privacy tag, and — only when the rubric's bar is met — a quote of praise addressed to you. The frame, or a REDACTED placeholder, is appended to the day's H.264 video; the verdict goes into the frame log. If the call fails, the frame is redacted (fail-closed).
 
 When a work day ends, the diary scheduler condenses that day's frame logs into a timeline of activity blocks, adds totals, praise and your session notes, and asks Claude Opus 5.5 for a structured entry (JSON schema output, streamed, with server-side fallback to another model if the request is declined). It retries with back-off if the API is unavailable, saves a local entry in the meantime, and schedules the morning notification.
 
@@ -165,7 +166,7 @@ There's no Xcode project: `build.sh` compiles everything with `swiftc`. To work 
 swift scripts/make-icon.swift   # regenerate Resources/AppIcon.icns
 ```
 
-Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.app` keeps test recordings out of `~/Movies`. Tuning knobs (capture interval, playback rate, bitrate) are at the top of `TimeLapseRecorder.swift`.
+Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.app` keeps test recordings out of `~/Movies`. Tuning knobs (playback rate, bitrate) are at the top of `TimeLapseRecorder.swift`.
 
 ## Limitations
 

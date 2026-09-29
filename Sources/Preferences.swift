@@ -12,6 +12,7 @@ enum Preferences {
         static let diaryHour = "WorkTimeLaps.diaryNotificationHour"
         static let diaryMinute = "WorkTimeLaps.diaryNotificationMinute"
         static let diaryWithClaude = "WorkTimeLaps.writeDiaryWithClaude"
+        static let captureInterval = "WorkTimeLaps.captureIntervalSeconds"
     }
 
     private static var defaults: UserDefaults { .standard }
@@ -48,5 +49,35 @@ enum Preferences {
     static var writeDiaryWithClaude: Bool {
         get { defaults.object(forKey: Key.diaryWithClaude) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.diaryWithClaude) }
+    }
+
+    // MARK: - Capture interval
+
+    static let captureIntervalOptions: [(label: String, seconds: Int)] = [
+        ("10 sec", 10),
+        ("30 sec", 30),
+        ("1 min", 60),
+        ("2 min", 120)
+    ]
+
+    /// Seconds between screenshots. Once a minute by default: enough to see
+    /// the shape of a day, at about a sixth of the API cost of every 10 s.
+    /// A change takes effect within one interval and starts a new session.
+    static var captureIntervalSeconds: Int {
+        get {
+            let stored = defaults.integer(forKey: Key.captureInterval)
+            return captureIntervalOptions.contains(where: { $0.seconds == stored }) ? stored : 60
+        }
+        set { defaults.set(newValue, forKey: Key.captureInterval) }
+    }
+
+    /// Estimated API cost of one analyzed screenshot: ~1,600 image tokens
+    /// plus ~2,000 prompt tokens in at $1 per million, ~150 tokens out at $5
+    /// per million (Claude Haiku 4.5 list prices).
+    static let estimatedCostPerScreenshot = 0.0044
+
+    /// Estimated API cost of eight active hours at `intervalSeconds`.
+    static func estimatedCostPerWorkDay(intervalSeconds: Int) -> Double {
+        8 * 3600 / Double(max(intervalSeconds, 1)) * estimatedCostPerScreenshot
     }
 }

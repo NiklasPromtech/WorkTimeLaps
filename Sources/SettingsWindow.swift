@@ -43,6 +43,14 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    var captureIntervalSeconds: Int {
+        get { Preferences.captureIntervalSeconds }
+        set {
+            objectWillChange.send()
+            Preferences.captureIntervalSeconds = newValue
+        }
+    }
+
     var retentionHours: Int {
         get { RetentionSweeper.retentionHours }
         set {
@@ -186,7 +194,7 @@ struct SettingsView: View {
 
                 section(
                     title: "Recording",
-                    subtitle: "WorkTimeLaps captures a screenshot every 10 seconds and pauses by itself while your screen is locked or your Mac is asleep."
+                    subtitle: "WorkTimeLaps takes a screenshot at the interval below and pauses by itself while your screen is locked or your Mac is asleep."
                 ) {
                     RecordingSettings(model: model)
                 }
@@ -200,7 +208,7 @@ struct SettingsView: View {
 
                 section(
                     title: "Anthropic API key",
-                    subtitle: "Screenshots are labeled by Claude Haiku 4.5 (roughly half a cent each, about $10 for an 8-hour day). Diary entries are written by Claude Opus 5.5 from the day's text log (about $0.10 a day). The key is stored in your keychain."
+                    subtitle: "Screenshots are labeled by Claude Haiku 4.5, roughly half a cent each. Diary entries are written by Claude Opus 5.5 from the day's text log, about $0.10 a day. The key is stored in your keychain."
                 ) {
                     APIKeySettings(model: model)
                 }
@@ -292,6 +300,26 @@ private struct RecordingSettings: View {
             ))
 
             HStack(spacing: 12) {
+                Text("Screenshot every")
+                Picker("Screenshot every", selection: Binding(
+                    get: { model.captureIntervalSeconds },
+                    set: { model.captureIntervalSeconds = $0 }
+                )) {
+                    ForEach(Preferences.captureIntervalOptions, id: \.seconds) { option in
+                        Text(option.label).tag(option.seconds)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 320)
+            }
+            .padding(.top, 4)
+            Text(intervalCaption)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 12) {
                 Text("Keep video for")
                 Picker("Keep video for", selection: Binding(
                     get: { model.retentionHours },
@@ -311,6 +339,16 @@ private struct RecordingSettings: View {
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+extension RecordingSettings {
+    /// "About $2 of API usage for an 8-hour day…", for the chosen interval.
+    var intervalCaption: String {
+        let cost = Preferences.estimatedCostPerWorkDay(intervalSeconds: model.captureIntervalSeconds)
+        let rounded = (cost * 2).rounded() / 2
+        let amount = rounded == rounded.rounded() ? String(format: "$%.0f", rounded) : String(format: "$%.2f", rounded)
+        return "About \(amount) of API usage for an 8-hour day. Shorter intervals give a smoother video and catch brief moments, like a quick message of praise; longer ones cost less. Changes apply within one interval."
     }
 }
 

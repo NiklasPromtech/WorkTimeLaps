@@ -114,30 +114,39 @@ final class TimeLapseRecorder {
 
     // MARK: - Config
 
-    /// Time between screenshots, in real seconds.
-    let captureInterval: TimeInterval = 10.0
+    /// Time between screenshots, in real seconds. Read from Settings (once a
+    /// minute by default); a change applies from the next session.
+    private(set) var captureInterval = TimeInterval(Preferences.captureIntervalSeconds)
 
-    /// Playback frame rate. With a 10-second capture interval and 10 fps
-    /// playback the time lapse plays back at 100× speed.
+    /// Playback frame rate. At one screenshot a minute and 10 fps, an hour
+    /// plays back in 6 seconds and a full work day in under a minute.
     let playbackFPS: Int32 = 10
 
     /// H.264 target bitrate. Screen content compresses very well, so 3 Mbps
     /// is plenty at 10 fps.
     let videoBitrate: Int = 3_000_000
 
-    /// EMA smoothing factor for the engagement "rev meter". α=0.1 gives a
-    /// ~20-sample effective window.
-    private let engagementAlpha: Double = 0.1
+    /// EMA smoothing factor for the engagement "rev meter", tied to real
+    /// time rather than to frames: a time constant of about 95 seconds,
+    /// which is α ≈ 0.1 at 10-second frames and ≈ 0.47 at one a minute.
+    private var engagementAlpha: Double {
+        1 - exp(-captureInterval / 95)
+    }
 
-    /// The sidecar is rewritten every this many frames (about once a
+    /// The sidecar is rewritten about once a minute (every frame at one a
     /// minute) and whenever a session pauses or ends. Rewriting on every
-    /// frame meant several GB of disk writes over a full day.
-    private let sidecarFlushInterval = 6
+    /// 10-second frame meant several GB of disk writes over a full day.
+    private var sidecarFlushInterval: Int {
+        max(1, Int((60 / captureInterval).rounded()))
+    }
 
     /// Movie fragments keep a video that was cut short by a crash or power
-    /// loss playable up to the last fragment. Measured in video time: 3 s
-    /// of video is 30 frames, about five minutes of real time.
-    private let movieFragmentInterval = CMTime(value: 3, timescale: 1)
+    /// loss playable up to the last fragment. One fragment per ~5 minutes of
+    /// real time, expressed in video time.
+    private var movieFragmentInterval: CMTime {
+        let frames = max(1, Int((300 / captureInterval).rounded()))
+        return CMTime(value: CMTimeValue(frames), timescale: playbackFPS)
+    }
 
     /// Optional Claude Haiku analyzer. When set, frames that may leave the
     /// Mac are sent to the API for a safety verdict, category, summary and
@@ -257,6 +266,7 @@ final class TimeLapseRecorder {
     func start() async throws {
         guard !isRecording else { throw RecorderError.alreadyRecording }
         try await prepareCapture()
+        captureInterval = TimeInterval(Preferences.captureIntervalSeconds)
         resetSessionState()
         userPauseUntil = nil
         isRecording = true
@@ -339,6 +349,7 @@ final class TimeLapseRecorder {
             let tickStart = Date()
 
             await rolloverIfWorkDayEnded(now: tickStart)
+            await applyIntervalChangeIfNeeded()
 
             if let until = userPauseUntil, until <= tickStart {
                 userPauseUntil = nil
@@ -361,6 +372,19 @@ final class TimeLapseRecorder {
                 break  // CancellationError — stop() was called.
             }
         }
+    }
+
+    /// Picks up a new capture interval from Settings. The current session is
+    /// closed first, so every session is recorded at a single interval.
+    private func applyIntervalChangeIfNeeded() async {
+        let desired = TimeInterval(Preferences.captureIntervalSeconds)
+        guard desired != captureInterval else { return }
+        if session != nil {
+            await finishSession()
+            resetSessionState()
+        }
+        captureInterval = desired
+        postStateChange()
     }
 
     /// Closes the session when the work day it started in has ended. The
