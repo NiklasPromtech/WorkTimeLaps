@@ -461,7 +461,9 @@ final class TimeLapseRecorder {
                 image: image,
                 previous: previous,
                 vocabulary: ActivityVocabulary.recent(),
-                userName: NSFullUserName()
+                userName: NSFullUserName(),
+                now: now,
+                extractPlanning: Preferences.noticeFollowUpsAndMeetings
             )
             guard isRecording else { return }
             switch outcome {
@@ -601,7 +603,9 @@ final class TimeLapseRecorder {
             redacted: isRedacted,
             redactionReason: redactionReason,
             sleepGapSec: sleepGapSec,
-            activity: activityText.isEmpty ? nil : activityText
+            activity: activityText.isEmpty ? nil : activityText,
+            conversation: analysis?.conversation,
+            meetings: (analysis?.meetings.isEmpty ?? true) ? nil : analysis?.meetings
         ))
         session?.lastUpdated = now
         framesSinceFlush += 1

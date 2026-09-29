@@ -13,6 +13,7 @@ enum Preferences {
         static let diaryMinute = "WorkTimeLaps.diaryNotificationMinute"
         static let diaryWithClaude = "WorkTimeLaps.writeDiaryWithClaude"
         static let captureInterval = "WorkTimeLaps.captureIntervalSeconds"
+        static let planning = "WorkTimeLaps.noticeFollowUpsAndMeetings"
     }
 
     private static var defaults: UserDefaults { .standard }
@@ -49,6 +50,13 @@ enum Preferences {
     static var writeDiaryWithClaude: Bool {
         get { defaults.object(forKey: Key.diaryWithClaude) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.diaryWithClaude) }
+    }
+
+    /// Notice unanswered requests in work conversations and upcoming
+    /// meetings on screen, so the morning brief can plan the day.
+    static var noticeFollowUpsAndMeetings: Bool {
+        get { defaults.object(forKey: Key.planning) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.planning) }
     }
 
     // MARK: - Capture interval

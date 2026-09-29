@@ -152,4 +152,55 @@ struct FrameAnalysis: Sendable, Codable {
     /// Best-guess of who said it (sender name from the chat / email
     /// header on screen). Empty when not extractable.
     let recognitionSpeaker: String
+
+    // MARK: - Planning signals
+
+    /// A work conversation on screen, with any request still waiting on
+    /// someone. Nil when no conversation is visible, and always nil for
+    /// frames tagged with a privacy category.
+    var conversation: ConversationSnapshot? = nil
+
+    /// Upcoming meetings visible on screen (calendar, invite, email).
+    var meetings: [MeetingMention] = []
+}
+
+/// A conversation seen on screen — who it's with, what it's about, and
+/// whether a request is waiting on someone. The morning brief turns these
+/// into follow-ups ("You asked Peter to get back to you about Erik").
+struct ConversationSnapshot: Codable, Sendable, Hashable {
+    /// The other person, or the channel/group name.
+    let with: String
+    /// Where the conversation is (Slack, LinkedIn, Gmail…).
+    let app: String?
+    /// What it's about, a few words.
+    let topic: String
+    /// Who wrote the most recent visible message: "me" or "them".
+    let lastFrom: String?
+    /// An unanswered ask as a short action ("Peter to get back about Erik").
+    let request: String?
+    /// Who made that ask: "me" (the user is waiting on them) or "them" (the
+    /// user owes it).
+    let requestBy: String?
+
+    var hasOpenRequest: Bool {
+        !(request ?? "").isEmpty && (requestBy == "me" || requestBy == "them")
+    }
+}
+
+/// An upcoming meeting seen on screen.
+struct MeetingMention: Codable, Sendable, Hashable {
+    let title: String
+    /// Local start time, "yyyy-MM-dd'T'HH:mm", as read from the screen.
+    let start: String
+    /// Attendee or organizer names, when shown.
+    let with: String?
+
+    /// The start as a date in the current time zone, if it parses.
+    var startDate: Date? {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm"
+        return f.date(from: start)
+    }
 }

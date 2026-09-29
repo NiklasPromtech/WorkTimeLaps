@@ -47,14 +47,27 @@ struct DiaryWriter: Sendable {
         let timeline: [WorkDiary.TimelineItem]
         let looseEnds: [String]
         let dayShape: WorkDiary.DayShape
+        /// Present when the brief also plans the day it's read on.
+        let today: TodayDraft?
+        let followUps: [FollowUpUpdate]?
+    }
+
+    struct TodayDraft: Decodable, Sendable {
+        let focus: [String]
+        let meetings: [DayPlan.MeetingPrep]
     }
 
     let apiKey: String
     var model: String = DiaryWriter.defaultModel
 
-    /// Writes the entry. Returns the draft and the model that produced it
-    /// (which differs from `model` if the request fell back).
-    func write(_ material: DayMaterial) async throws -> (draft: Draft, model: String) {
+    /// Writes the entry, and the plan for the day when `plan` is given.
+    /// Returns the draft and the model that produced it (which differs from
+    /// `model` if the request fell back).
+    func write(_ material: DayMaterial, plan: PlanContext? = nil) async throws -> (draft: Draft, model: String) {
+        var prompt = DiaryComposer.promptText(for: material)
+        if let plan {
+            prompt += "\n\n" + DiaryComposer.planPromptText(plan)
+        }
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
@@ -65,7 +78,8 @@ struct DiaryWriter: Sendable {
         request.timeoutInterval = 300
         request.httpBody = try JSONSerialization.data(withJSONObject: Self.requestBody(
             model: model,
-            prompt: DiaryComposer.promptText(for: material)
+            prompt: prompt,
+            includePlan: plan != nil
         ))
 
         let (text, servedModel, stopReason) = try await stream(request)
@@ -88,19 +102,19 @@ struct DiaryWriter: Sendable {
 
     // MARK: - Request
 
-    static func requestBody(model: String, prompt: String) -> [String: Any] {
+    static func requestBody(model: String, prompt: String, includePlan: Bool = false) -> [String: Any] {
         [
             "model": model,
-            // Thinking counts toward max_tokens; the entry itself is ~1-2k.
+            // Thinking counts toward max_tokens; the entry itself is ~1-3k.
             "max_tokens": 16000,
             "stream": true,
-            "system": systemPrompt,
+            "system": includePlan ? systemPrompt + "\n\n" + planInstructions : systemPrompt,
             "fallbacks": "default",
             "output_config": [
                 "effort": "medium",
                 "format": [
                     "type": "json_schema",
-                    "schema": schema
+                    "schema": schema(includePlan: includePlan)
                 ]
             ],
             "messages": [
@@ -130,7 +144,67 @@ struct DiaryWriter: Sendable {
     - dayShape: deep_focus, steady, collaborative, scattered or light.
     """
 
-    static var schema: [String: Any] {
+    static let planInstructions = """
+    The brief has a second part: a short plan for the day it's read on (<plan_day>), to help the person make progress that day.
+    - today.focus: 1 to 3 concrete suggestions for moving work forward, grounded in what was in progress, loose ends and open follow-ups. No generic productivity advice; leave it empty if the log gives nothing to go on.
+    - today.meetings: meetings from <upcoming_meetings> on the plan day, soonest first. time is HH:MM. context: one sentence tying the meeting to related work or conversations in the log (for example "You worked on the Gant analysis last week"), or saying nothing related shows up. prepared: true only if the log shows the person worked on the meeting's topic after it was first seen. questions: 3 to 5 prep questions or points to bring, grounded in what the log shows.
+    - followUps: the complete, updated list. Start from <open_followups> and keep their ids. Set status to "resolved" when <conversations> shows the request was answered or done. Add new ones, with id "new", for requests still open in <conversations>; never add one listed in <closed_followups>. owner is "them" when the person is waiting on someone and "me" when the person owes it. since is the date it was first seen (YYYY-MM-DD). note: a short suggested next step for open ones ("Nudge Peter, it's been three days"), or empty.
+    """
+
+    static func schema(includePlan: Bool) -> [String: Any] {
+        var schema = baseSchema
+        guard includePlan,
+              var properties = schema["properties"] as? [String: Any],
+              var required = schema["required"] as? [String] else { return schema }
+
+        properties["today"] = [
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["focus", "meetings"],
+            "properties": [
+                "focus": ["type": "array", "items": ["type": "string"]],
+                "meetings": [
+                    "type": "array",
+                    "items": [
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["title", "time", "with", "context", "prepared", "questions"],
+                        "properties": [
+                            "title": ["type": "string"],
+                            "time": ["type": "string"],
+                            "with": ["type": "string"],
+                            "context": ["type": "string"],
+                            "prepared": ["type": "boolean"],
+                            "questions": ["type": "array", "items": ["type": "string"]]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        properties["followUps"] = [
+            "type": "array",
+            "items": [
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "with", "request", "owner", "since", "status", "note"],
+                "properties": [
+                    "id": ["type": "string"],
+                    "with": ["type": "string"],
+                    "request": ["type": "string"],
+                    "owner": ["type": "string", "enum": ["me", "them"]],
+                    "since": ["type": "string"],
+                    "status": ["type": "string", "enum": ["open", "resolved"]],
+                    "note": ["type": "string"]
+                ]
+            ]
+        ]
+        required += ["today", "followUps"]
+        schema["properties"] = properties
+        schema["required"] = required
+        return schema
+    }
+
+    private static var baseSchema: [String: Any] {
         [
             "type": "object",
             "additionalProperties": false,

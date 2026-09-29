@@ -319,3 +319,184 @@ enum DiaryComposer {
         )
     }
 }
+
+// MARK: - Plan for the day
+
+/// What the morning brief needs to plan the day it's read on.
+struct PlanContext: Sendable {
+    /// The work day the plan is for.
+    let planDayKey: String
+    /// Conversations seen on the diary's day, one line per person.
+    let conversations: [String]
+    let openFollowUps: [FollowUp]
+    let closedFollowUps: [FollowUp]
+    /// Meetings seen on screen that start on the plan day or the day after.
+    let meetings: [MeetingMention]
+    /// People talked to in the last two weeks, and about what.
+    let recentConversations: [String]
+    /// A line per recent work day: its diary headline, or top activities.
+    let recentWork: [String]
+    /// False when noticing follow-ups and meetings is turned off.
+    let includesFollowUps: Bool
+}
+
+extension DiaryComposer {
+
+    private static let lookbackDays = 14
+
+    /// Gathers the plan context for the brief written about `material`'s day
+    /// and read on `planDayKey`. Reads the last two weeks of frame logs, so
+    /// call it off the main thread.
+    static func planContext(for material: DayMaterial, planDayKey: String,
+                            includeFollowUps: Bool, now: Date = Date()) -> PlanContext {
+        let windowStart = now.addingTimeInterval(-Double(lookbackDays + 1) * 86_400)
+        let recent = recentFrames(since: windowStart)
+
+        // Meetings on the plan day or the day after, deduplicated by title
+        // and start time; the earliest sighting is kept.
+        var meetings: [MeetingMention] = []
+        if includeFollowUps, let planDay = WorkDay.interval(forKey: planDayKey) {
+            let horizon = planDay.end.addingTimeInterval(86_400)
+            var seen = Set<String>()
+            for frame in recent {
+                for m in frame.meetings ?? [] {
+                    guard let start = m.startDate, start >= planDay.start, start < horizon else { continue }
+                    let key = RecognitionStore.normalizedQuote(m.title) + "|" + m.start
+                    if seen.insert(key).inserted { meetings.append(m) }
+                }
+            }
+            meetings.sort { ($0.startDate ?? .distantFuture) < ($1.startDate ?? .distantFuture) }
+        }
+
+        // Recent conversations by person (outside the diary's own day).
+        var recentConversations: [String] = []
+        if includeFollowUps {
+            var byPerson: [String: (name: String, topics: [String], last: Date)] = [:]
+            for frame in recent where WorkDay.key(for: frame.t) != material.dayKey {
+                guard let c = frame.conversation else { continue }
+                let key = RecognitionStore.normalizedQuote(c.with)
+                var entry = byPerson[key] ?? (c.with, [], frame.t)
+                if !c.topic.isEmpty && !entry.topics.contains(c.topic) { entry.topics.append(c.topic) }
+                entry.last = max(entry.last, frame.t)
+                byPerson[key] = entry
+            }
+            recentConversations = byPerson.values
+                .sorted { $0.last > $1.last }
+                .prefix(25)
+                .map { "\($0.name) — \($0.topics.suffix(3).joined(separator: "; ")) · last seen \(WorkDay.key(for: $0.last))" }
+        }
+
+        return PlanContext(
+            planDayKey: planDayKey,
+            conversations: includeFollowUps ? conversationLines(material.frames) : [],
+            openFollowUps: includeFollowUps ? FollowUpStore.open : [],
+            closedFollowUps: includeFollowUps ? FollowUpStore.recentlyClosedByUser(now: now) : [],
+            meetings: Array(meetings.prefix(12)),
+            recentConversations: recentConversations,
+            recentWork: recentWorkLines(before: material.dayKey, frames: recent),
+            includesFollowUps: includeFollowUps
+        )
+    }
+
+    /// Frames from session logs touched in the window, oldest first. Covers
+    /// the recording in progress too, whose log isn't in the journal yet.
+    private static func recentFrames(since start: Date) -> [FrameEntry] {
+        let folder = TimeLapseRecorder.recordingsFolder
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        var frames: [FrameEntry] = []
+        for url in urls where url.lastPathComponent.hasPrefix("TimeLapse_") && url.pathExtension == "json" {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            guard (modified ?? .distantPast) >= start, let session = try? SessionWriter.read(from: url) else { continue }
+            frames.append(contentsOf: session.frames.filter { $0.t >= start })
+        }
+        return frames.sorted { $0.t < $1.t }
+    }
+
+    /// One line per person talked to in `frames`: when, about what, the
+    /// latest request seen, and who wrote last.
+    static func conversationLines(_ frames: [FrameEntry]) -> [String] {
+        var order: [String] = []
+        var groups: [String: [(t: Date, c: ConversationSnapshot)]] = [:]
+        for frame in frames {
+            guard let c = frame.conversation else { continue }
+            let key = RecognitionStore.normalizedQuote(c.with)
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append((frame.t, c))
+        }
+        return order.prefix(40).compactMap { key in
+            guard let snaps = groups[key], let first = snaps.first, let latest = snaps.last else { return nil }
+            var topics: [String] = []
+            for s in snaps where !s.c.topic.isEmpty && !topics.contains(s.c.topic) { topics.append(s.c.topic) }
+            var line = "\(DiaryFormat.clock(first.t))–\(DiaryFormat.clock(latest.t)) · \(latest.c.with)"
+            if let app = latest.c.app { line += " (\(app))" }
+            if !topics.isEmpty { line += " — \(topics.suffix(3).joined(separator: "; "))" }
+            if let ask = snaps.last(where: { $0.c.hasOpenRequest }) {
+                let who = ask.c.requestBy == "me" ? "you asked" : "they asked"
+                line += " · request at \(DiaryFormat.clock(ask.t)), \(who): \(ask.c.request ?? "")"
+            } else {
+                line += " · no open request seen"
+            }
+            if let from = latest.c.lastFrom {
+                line += " · last message from \(from == "me" ? "you" : latest.c.with) (as of \(DiaryFormat.clock(latest.t)))"
+            }
+            return line
+        }
+    }
+
+    /// A line per recent work day before `dayKey`: the diary's headline and
+    /// highlights when there is one, otherwise the top activities.
+    private static func recentWorkLines(before dayKey: String, frames: [FrameEntry]) -> [String] {
+        var framesByDay: [String: [FrameEntry]] = [:]
+        for frame in frames { framesByDay[WorkDay.key(for: frame.t), default: []].append(frame) }
+
+        var lines: [String] = []
+        for offset in 1...lookbackDays {
+            guard let key = WorkDay.key(dayKey, offsetBy: -offset) else { continue }
+            if let diary = DiaryStore.load(dayKey: key) {
+                var line = "\(key) — \(diary.headline)"
+                if !diary.highlights.isEmpty { line += ". Highlights: " + diary.highlights.prefix(4).joined(separator: "; ") }
+                lines.append(line)
+            } else if let dayFrames = framesByDay[key], !dayFrames.isEmpty {
+                let blocks = ActivityTimeline.blocks(from: dayFrames, captureInterval: 60).filter { !isPrivate($0) }
+                var seconds: [String: Double] = [:]
+                for b in blocks { seconds[b.activity, default: 0] += b.activeSeconds }
+                let top = seconds.sorted { $0.value > $1.value }.prefix(4)
+                    .map { "\($0.key) \(DiaryFormat.duration($0.value))" }
+                if !top.isEmpty { lines.append("\(key) — " + top.joined(separator: ", ")) }
+            }
+        }
+        return lines
+    }
+
+    /// The plan part of the brief's prompt.
+    static func planPromptText(_ context: PlanContext) -> String {
+        let planDate = WorkDay.date(fromKey: context.planDayKey).map(DiaryFormat.longDate) ?? context.planDayKey
+        var out: [String] = []
+        out.append("<plan_day>")
+        out.append("Also plan \(planDate): the day the person reads this brief, at 09:00.")
+        out.append("</plan_day>")
+
+        func section(_ tag: String, _ lines: [String]) {
+            guard !lines.isEmpty else { return }
+            out.append("")
+            out.append("<\(tag)>")
+            out.append(contentsOf: lines)
+            out.append("</\(tag)>")
+        }
+
+        section("conversations", context.conversations)
+        section("open_followups", context.openFollowUps.map { f in
+            let side = f.isWaitingOnThem ? "waiting on \(f.with)" : "you owe \(f.with)"
+            return "id \(f.id) · \(side): \(f.request) · since \(f.since)"
+        })
+        section("closed_followups", context.closedFollowUps.map { "\($0.with): \($0.request)" })
+        section("upcoming_meetings", context.meetings.map { m in
+            let with = (m.with ?? "").isEmpty ? "" : " · with \(m.with!)"
+            return "\(m.start.replacingOccurrences(of: "T", with: " ")) · \(m.title)\(with)"
+        })
+        section("recent_conversations", context.recentConversations)
+        section("recent_work", context.recentWork)
+        return out.joined(separator: "\n")
+    }
+}

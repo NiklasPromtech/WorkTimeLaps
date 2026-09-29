@@ -5,6 +5,7 @@ import Foundation
 CoreTests.run()
 HighlightsTests.run()
 DiaryTests.run()
+PlanTests.run()
 
 print("\n\(testCount) tests, \(testFailures) failure\(testFailures == 1 ? "" : "s")")
 exit(testFailures == 0 ? 0 : 1)

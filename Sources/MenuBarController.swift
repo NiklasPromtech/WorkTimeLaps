@@ -9,7 +9,7 @@ import Cocoa
 ///   Stop Recording / Start Recording
 ///   Pause ▸ 15 minutes · 1 hour · Until tomorrow   (or Resume Recording)
 ///   ─────
-///   Latest Diary… · Journal… · Highlights…
+///   Daily Brief… · Journal… · Highlights…
 ///   ─────
 ///   Settings… · Quit
 @MainActor
@@ -120,7 +120,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let diaryItem = NSMenuItem(title: "Latest Diary…", action: #selector(openDiary), keyEquivalent: "d")
+        let diaryItem = NSMenuItem(title: "Daily Brief…", action: #selector(openDiary), keyEquivalent: "d")
         diaryItem.target = self
         menu.addItem(diaryItem)
 

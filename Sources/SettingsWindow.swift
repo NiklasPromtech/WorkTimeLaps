@@ -94,6 +94,14 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    var noticeFollowUpsAndMeetings: Bool {
+        get { Preferences.noticeFollowUpsAndMeetings }
+        set {
+            objectWillChange.send()
+            Preferences.noticeFollowUpsAndMeetings = newValue
+        }
+    }
+
     // MARK: API key
 
     var apiKeyFingerprint: String? { APIKeyStore.load().map(APIKeyStore.fingerprint) }
@@ -383,6 +391,16 @@ private struct DiarySettings: View {
                 set: { model.writeDiaryWithClaude = $0 }
             ))
             Text("When off, or without an API key, the diary is assembled on your Mac from the day's numbers and longest stretches.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle("Plan my day from follow-ups and meetings", isOn: Binding(
+                get: { model.noticeFollowUpsAndMeetings },
+                set: { model.noticeFollowUpsAndMeetings = $0 }
+            ))
+            .padding(.top, 4)
+            Text("Notices unanswered requests in work conversations and upcoming meetings in calendars and invites on screen, so the morning brief can tell you who you're waiting on, what you owe, and how to prep. Names and one-line requests are kept in your log and sent to Claude with the brief; conversations tagged personal are skipped.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

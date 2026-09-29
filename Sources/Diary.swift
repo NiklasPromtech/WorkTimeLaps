@@ -30,6 +30,11 @@ struct WorkDiary: Codable, Sendable, Identifiable {
     /// Why Claude couldn't write this entry, for a local fallback.
     let note: String?
 
+    /// The morning brief's plan for the day it's read on: focus, meetings to
+    /// prep for, follow-ups. Only on the most recent entry when it was
+    /// written, and nil for entries written before plans existed.
+    var today: DayPlan? = nil
+
     var isWrittenByClaude: Bool { model != nil }
 
     struct TimelineItem: Codable, Sendable, Hashable {
@@ -78,6 +83,51 @@ struct WorkDiary: Codable, Sendable, Identifiable {
             case .scattered:     return "sparkles"
             case .light:         return "leaf.fill"
             }
+        }
+    }
+}
+
+/// What to do on the day the brief is read.
+struct DayPlan: Codable, Sendable {
+    /// The work day the plan is for.
+    let dayKey: String
+    /// 1–3 concrete suggestions for moving work forward.
+    let focus: [String]
+    let meetings: [MeetingPrep]
+    /// Open follow-ups when the brief was written: what others owe the
+    /// person, and what the person owes others.
+    let waitingOn: [FollowUpItem]
+    let youOwe: [FollowUpItem]
+
+    var isEmpty: Bool {
+        focus.isEmpty && meetings.isEmpty && waitingOn.isEmpty && youOwe.isEmpty
+    }
+
+    struct MeetingPrep: Codable, Sendable, Hashable {
+        let title: String
+        /// "HH:mm".
+        let time: String
+        let with: String
+        /// How the meeting relates to recent work and conversations.
+        let context: String
+        /// Whether the log shows prep work since the meeting was scheduled.
+        let prepared: Bool
+        let questions: [String]
+    }
+
+    struct FollowUpItem: Codable, Sendable, Hashable {
+        let followUpID: String
+        let with: String
+        let request: String
+        let since: String
+        let suggestion: String?
+
+        init(_ followUp: FollowUp) {
+            followUpID = followUp.id
+            with = followUp.with
+            request = followUp.request
+            since = followUp.since
+            suggestion = followUp.note
         }
     }
 }
@@ -216,6 +266,33 @@ enum DiaryStore {
         for paragraph in diary.entry {
             lines.append(paragraph)
             lines.append("")
+        }
+
+        if let plan = diary.today, !plan.isEmpty {
+            let planDay = WorkDay.date(fromKey: plan.dayKey).map(DiaryFormat.longDate) ?? plan.dayKey
+            lines.append("## Today — \(planDay)")
+            lines.append("")
+            if !plan.focus.isEmpty {
+                lines.append(contentsOf: plan.focus.map { "- \($0)" })
+                lines.append("")
+            }
+            for meeting in plan.meetings {
+                let with = meeting.with.isEmpty ? "" : " with \(meeting.with)"
+                lines.append("**\(meeting.time) \(meeting.title)**\(with)\(meeting.prepared ? "" : " — not prepped yet")")
+                if !meeting.context.isEmpty { lines.append(meeting.context) }
+                lines.append(contentsOf: meeting.questions.map { "- \($0)" })
+                lines.append("")
+            }
+            if !plan.waitingOn.isEmpty {
+                lines.append("**Waiting on**")
+                lines.append(contentsOf: plan.waitingOn.map { "- \($0.with): \($0.request) (since \($0.since))" })
+                lines.append("")
+            }
+            if !plan.youOwe.isEmpty {
+                lines.append("**You owe**")
+                lines.append(contentsOf: plan.youOwe.map { "- \($0.with): \($0.request) (since \($0.since))" })
+                lines.append("")
+            }
         }
 
         if !diary.highlights.isEmpty {

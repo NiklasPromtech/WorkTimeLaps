@@ -70,8 +70,8 @@ struct WelcomeView: View {
             VStack(alignment: .leading, spacing: 14) {
                 FeatureRow(symbol: "record.circle", title: "Records your day as a time-lapse",
                            text: "A screenshot every minute becomes a video of your whole day that plays in under a minute. Recording pauses while your screen is locked.")
-                FeatureRow(symbol: "book.closed", title: "Writes your work diary",
-                           text: "After each work day ends, Claude writes a short entry about what you worked on. It's waiting for you at 9:00 the next morning.")
+                FeatureRow(symbol: "book.closed", title: "Writes your daily brief",
+                           text: "After each work day ends, Claude writes a short diary of it and a plan for the next morning: meetings to prep for, who you're waiting on, what you owe. It's waiting for you at 9:00.")
                 FeatureRow(symbol: "star.bubble", title: "Keeps the receipts",
                            text: "Specific praise from colleagues and clients is saved to Highlights for your next review.")
             }
@@ -101,7 +101,7 @@ struct WelcomeView: View {
             Label("What leaves your Mac", systemImage: "lock.shield")
                 .font(.system(.headline, design: .rounded))
             PrivacyPoint("To label your activity, each screenshot is downscaled and sent to Anthropic's API (Claude Haiku 4.5) with your API key. Screenshots of blocked apps — Messages, Signal, WhatsApp and others you add — are never sent.")
-            PrivacyPoint("Diary entries are written by Claude from the day's text log, never from screenshots.")
+            PrivacyPoint("The daily brief is written by Claude from the day's text log, including names and requests from work conversations and meetings seen on screen. Never from screenshots.")
             PrivacyPoint("Everything else stays in ~/Movies/WorkTimeLaps. Video is deleted after 48 hours; the text log, diaries and highlights are kept.")
             PrivacyPoint("API usage costs roughly half a cent per screenshot — about $2 for an 8-hour day at one a minute — plus about $0.10 per diary entry. You can change how often it looks in Settings.")
             PrivacyPoint("Recording a work computer may be covered by your employer's policies. Check before you start.")

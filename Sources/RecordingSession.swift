@@ -69,6 +69,12 @@ struct FrameEntry: Codable, Sendable {
     /// vocabulary. Optional because older sidecars predate it; readers fall
     /// back to the category name.
     var activity: String?
+
+    /// A work conversation visible in this frame, if any.
+    var conversation: ConversationSnapshot? = nil
+
+    /// Upcoming meetings visible in this frame, if any.
+    var meetings: [MeetingMention]? = nil
 }
 
 /// End-of-session rollup. `categoryCounts` is `[String: Int]` because

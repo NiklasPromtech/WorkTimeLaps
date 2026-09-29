@@ -15,16 +15,18 @@
 </p>
 
 <p align="center">
-  <img src="docs/diary.jpg" width="820" alt="A diary page: headline, a short first-person entry, highlights, where the time went, a timeline, kind words and loose ends">
+  <img src="docs/diary.jpg" width="820" alt="A daily brief: yesterday's headline and first-person entry, then today's focus, a meeting to prep for with questions, who you're waiting on and what you owe">
 </p>
 
-WorkTimeLaps takes a screenshot every minute while you work. Claude labels each one — what app, what task, how focused — and the frames become a video you can scrub through. After each work day ends, Claude turns the day's activity log into a short diary entry, and at 9:00 the next morning a notification tells you it's ready.
+WorkTimeLaps takes a screenshot every minute while you work. Claude labels each one — what app, what task, how focused — and the frames become a video you can scrub through. After each work day ends, Claude writes your **daily brief**: a short diary of yesterday, and a plan for today — meetings to prep for, who you're waiting on, and what you owe. At 9:00 a notification tells you it's ready.
 
 It's built for the question you can never answer on a Friday afternoon, or at review time: *what did I actually do?*
 
 ## Features
 
-- **Work Diary.** A page for every day you worked: a headline, a short first-person account, highlights, a timeline, where the time went, praise you received, and loose ends to pick up. Written by Claude from the day's text log (never from screenshots), or assembled locally if you'd rather not use the API for it. Every entry is also saved as Markdown.
+- **Daily brief.** Every morning, a page for the day before: a headline, a short first-person account, highlights, a timeline, where the time went and praise you received. Written by Claude from the day's text log (never from screenshots), or assembled locally if you'd rather not use the API for it, and also saved as Markdown.
+- **A plan for today.** The brief ends with what would move things forward today, the meetings coming up and how to prep for them, who you're waiting on, and what you owe.
+- **Follow-ups and meeting prep from what's on screen.** When a work conversation is on screen, WorkTimeLaps notes requests still waiting for an answer — *"Peter to get back to you about Erik"* — and keeps a list that closes items when a reply shows up, or when you tick them off. Meetings you look at in a calendar, invite or email become prep notes: how the meeting ties to your recent work, whether you've prepped, and questions to bring. No calendar or mailbox access needed.
 - **Always on, but not always recording.** Opens at login and starts recording by itself. Pauses automatically while your screen is locked, the display or Mac is asleep, or you pause it from the menu (15 minutes, an hour, or until tomorrow).
 - **Work days that match how you work.** A day runs from 02:00 to 02:00 by default, so a late night counts toward the day it started. The cutoff is configurable.
 - **Time-lapse video.** A whole work day plays back in under a minute. Screenshots are taken once a minute by default (10 seconds to 2 minutes in Settings). Videos are kept for 48 hours, then deleted automatically — the text log, journal, diaries and highlights are kept.
@@ -43,12 +45,13 @@ WorkTimeLaps has no server and no telemetry. The only network requests it makes 
 | What | Sent to | When |
 |---|---|---|
 | Each screenshot, downscaled to 1568 px and JPEG-compressed | Claude Haiku 4.5 | Once a minute while recording (configurable) — **except** frames of blocked apps and windows, WorkTimeLaps' own windows, and anything captured while paused or locked |
-| The day's text log: activity labels, one-line summaries, times, praise quotes and your session notes | Claude Opus 5.5 | Once per work day, to write the diary |
+| The day's text log: activity labels, one-line summaries, times, praise quotes and your session notes — plus, for today's plan, names and one-line requests from work conversations, meetings seen on screen, and recent diary headlines | Claude Opus 5.5 | Once per work day, to write the daily brief |
 
 Worth knowing:
 
 - **To catch a secret, Claude has to see it.** Frames that show a password or API key are sent for analysis like any other frame; redaction protects the saved video, the log, and anything you share from them. If something must never leave your Mac, add the app or window title to the block list — those frames are never sent.
-- **Private stays private in the diary.** Frames redacted by a privacy filter or block rule appear in the diary prompt only as "private time", with no labels.
+- **Private stays private in the brief.** Frames redacted by a privacy filter or block rule appear in the brief's prompt only as "private time", with no labels, and conversations tagged personal never become follow-ups.
+- **Follow-ups and meetings come from the same screenshots,** not from your calendar or inbox. To stop collecting names and requests, turn off **Plan my day from follow-ups and meetings** in Settings.
 - **Without an API key** the app still records and keeps a journal, but frames aren't labeled or checked for secrets, and diaries are assembled locally from the numbers.
 - The API key is stored in your macOS keychain.
 - Recording a work computer may be covered by your employer's policies or local law. Check before you start.
@@ -99,7 +102,7 @@ Once access is granted, recording starts on its own; if it doesn't, choose **Qui
 The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The shortcuts below work while the menu is open.
 
 - **Stop / Start Recording**, and **Pause** for 15 minutes, an hour, or until tomorrow.
-- **Latest Diary…** (⌘D) opens the Diary on the most recent finished day. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.
+- **Daily Brief…** (⌘D) opens the most recent brief. Tick off follow-ups as you handle them. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.
 - **Journal…** (⌘J) shows the week, each day's sessions, and per-session playback.
 - **Highlights…** (⌘H) collects the praise you've received over 7, 30 or 90 days, or the year.
 - **Settings…** (⌘,) has the login item, how often to take a screenshot, video retention, the day cutoff, the diary notification time, the API key, privacy filters and the block list.
@@ -116,6 +119,7 @@ Everything lives in `~/Movies/WorkTimeLaps` (or `$WORKTIMELAPS_DATA_DIR`, if set
 └── _journal/                                kept
     ├── 2026-09-29.json                      the work day's sessions
     ├── recognitions.json                    highlights
+    ├── follow-ups.json                      who you're waiting on, what you owe
     ├── activities.json                      rolling 2-hour activity vocabulary
     └── diary/
         ├── 2026-09-29.json
@@ -128,7 +132,9 @@ One session is recorded per work day (a new one starts at the cutoff, or wheneve
 
 Once a minute (by default) the recorder checks the front app and window against the block list. Anything else is sent to Claude Haiku in a single call that returns a JSON verdict: whether a secret is visible, a category (coding, writing, email, chat, meeting, browsing, design, terminal, reading, media, other), a specific activity label ("Stripe pricing config", reused across frames through a rolling vocabulary so the stream clusters cleanly), a one-line summary, an engagement score, a privacy tag, and — only when the rubric's bar is met — a quote of praise addressed to you. The frame, or a REDACTED placeholder, is appended to the day's H.264 video; the verdict goes into the frame log. If the call fails, the frame is redacted (fail-closed).
 
-When a work day ends, the diary scheduler condenses that day's frame logs into a timeline of activity blocks, adds totals, praise and your session notes, and asks Claude Opus 5.5 for a structured entry (JSON schema output, streamed, with server-side fallback to another model if the request is declined). It retries with back-off if the API is unavailable, saves a local entry in the meantime, and schedules the morning notification.
+The same call also notes any work conversation on screen (who it's with, what it's about, and whether a request is waiting on someone) and any upcoming meetings visible in a calendar, invite or email.
+
+When a work day ends, the diary scheduler condenses that day's frame logs into a timeline of activity blocks, adds totals, praise and your session notes, and asks Claude Opus 5.5 for a structured entry (JSON schema output, streamed, with server-side fallback to another model if the request is declined). For the most recent day it also sends the day's conversations, the open follow-ups, upcoming meetings and two weeks of diary headlines, and gets back today's plan and the updated follow-up list. It retries with back-off if the API is unavailable, saves a local entry in the meantime, and schedules the morning notification.
 
 ## Development
 
@@ -151,6 +157,7 @@ Sources/
 ├── DiaryComposer.swift                a day's stats, prompt text, local entries
 ├── DiaryWriter.swift                  Claude Opus call (streaming, JSON schema)
 ├── DiaryScheduler.swift               automatic diaries, notifications, retention
+├── FollowUps.swift                    who you're waiting on, what you owe
 ├── DiaryWindow.swift                  Diary window
 ├── WelcomeWindow.swift, SettingsWindow.swift
 ├── PrivacyFilterStore.swift, PrivacyRulesStore.swift, WorkContextProbe.swift
@@ -173,6 +180,7 @@ Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.
 - Records the main display only.
 - Built from source and not notarized — see the signing notes above.
 - Frame labels come from a model looking at screenshots, so they're sometimes vague or wrong. The diary is told to trust patterns over single frames, but read it as a draft of your day, not a record.
+- Follow-ups and meetings are only noticed when they're on screen as a screenshot is taken. At one a minute, a message you glance at for a few seconds can be missed, and replies you get by phone or in person are invisible — tick those off yourself.
 
 ## Contributing
 

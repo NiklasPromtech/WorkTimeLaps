@@ -134,20 +134,38 @@ final class DiaryScheduler {
     @discardableResult
     func write(dayKey: String, notify: Bool) async -> WorkDiary? {
         guard !inProgress.contains(dayKey) else { return nil }
-        guard let material = DiaryComposer.material(for: dayKey) else {
-            DiaryStore.updateStatus(for: dayKey) {
-                $0.attempts += 1
-                $0.lastAttempt = Date()
-                $0.lastError = "No activity log was found for this day."
-            }
-            return nil
-        }
         inProgress.insert(dayKey)
         lastErrors[dayKey] = nil
         DiaryStore.postUpdate()
         defer {
             inProgress.remove(dayKey)
             DiaryStore.postUpdate()
+        }
+
+        // The brief also plans the day it's read on — but only for the most
+        // recent finished day, so rewriting an old entry never touches
+        // today's follow-ups.
+        let now = Date()
+        let planDayKey = WorkDay.key(for: now)
+        let plansToday = isLatestFinishedDay(dayKey, before: planDayKey)
+        let includeFollowUps = Preferences.noticeFollowUpsAndMeetings
+
+        // Reading two weeks of logs takes a moment; keep it off the main thread.
+        let (loadedMaterial, plan) = await Task.detached(priority: .utility) { () -> (DayMaterial?, PlanContext?) in
+            guard let material = DiaryComposer.material(for: dayKey) else { return (nil, nil) }
+            let plan = plansToday
+                ? DiaryComposer.planContext(for: material, planDayKey: planDayKey, includeFollowUps: includeFollowUps, now: now)
+                : nil
+            return (material, plan)
+        }.value
+
+        guard let material = loadedMaterial else {
+            DiaryStore.updateStatus(for: dayKey) {
+                $0.attempts += 1
+                $0.lastAttempt = Date()
+                $0.lastError = "No activity log was found for this day."
+            }
+            return nil
         }
 
         let diary: WorkDiary
@@ -157,7 +175,21 @@ final class DiaryScheduler {
                 $0.lastAttempt = Date()
             }
             do {
-                let (draft, model) = try await DiaryWriter(apiKey: apiKey).write(material)
+                let (draft, model) = try await DiaryWriter(apiKey: apiKey).write(material, plan: plan)
+                var dayPlan: DayPlan?
+                if let plan {
+                    if plan.includesFollowUps, let updates = draft.followUps {
+                        FollowUpStore.apply(updates)
+                    }
+                    let open = plan.includesFollowUps ? FollowUpStore.open : []
+                    dayPlan = DayPlan(
+                        dayKey: plan.planDayKey,
+                        focus: draft.today?.focus ?? [],
+                        meetings: draft.today?.meetings ?? [],
+                        waitingOn: open.filter(\.isWaitingOnThem).map(DayPlan.FollowUpItem.init),
+                        youOwe: open.filter { !$0.isWaitingOnThem }.map(DayPlan.FollowUpItem.init)
+                    )
+                }
                 diary = WorkDiary(
                     dayKey: dayKey,
                     generatedAt: Date(),
@@ -170,7 +202,8 @@ final class DiaryScheduler {
                     dayShape: draft.dayShape,
                     stats: material.stats,
                     recognition: DiaryComposer.quotes(from: material.recognitions),
-                    note: nil
+                    note: nil,
+                    today: dayPlan
                 )
                 DiaryStore.updateStatus(for: dayKey) { $0.lastError = nil }
             } catch {
@@ -202,6 +235,12 @@ final class DiaryScheduler {
         return diary
     }
 
+    /// True when no recorded day lies between `dayKey` and the day in progress.
+    private func isLatestFinishedDay(_ dayKey: String, before todayKey: String) -> Bool {
+        guard dayKey < todayKey else { return false }
+        return !Journal.loadAllDays().contains { $0.date > dayKey && $0.date < todayKey }
+    }
+
     // MARK: - Notifications
 
     /// Announces the entry at the configured time (09:00 by default) on the
@@ -230,13 +269,26 @@ final class DiaryScheduler {
 
         let effectiveDeliver = max(deliverAt, now)
         let content = UNMutableNotificationContent()
-        if cal.isDate(effectiveDeliver, inSameDayAs: morning) {
-            content.title = "Yesterday's diary is ready"
+        if let plan = diary.today, !plan.isEmpty {
+            content.title = "Your daily brief is ready"
+            var today: [String] = []
+            if !plan.meetings.isEmpty {
+                today.append(plan.meetings.count == 1 ? "1 meeting to prep" : "\(plan.meetings.count) meetings to prep")
+            }
+            let followUps = plan.waitingOn.count + plan.youOwe.count
+            if followUps > 0 {
+                today.append(followUps == 1 ? "1 follow-up" : "\(followUps) follow-ups")
+            }
+            content.body = "Yesterday: \(diary.headline)." + (today.isEmpty ? "" : " Today: " + today.joined(separator: ", ") + ".")
         } else {
-            let day = WorkDay.date(fromKey: diary.dayKey) ?? interval.start
-            content.title = "Your diary for \(DiaryFormat.weekday(day)) is ready"
+            if cal.isDate(effectiveDeliver, inSameDayAs: morning) {
+                content.title = "Yesterday's diary is ready"
+            } else {
+                let day = WorkDay.date(fromKey: diary.dayKey) ?? interval.start
+                content.title = "Your diary for \(DiaryFormat.weekday(day)) is ready"
+            }
+            content.body = "\(diary.headline) · \(DiaryFormat.duration(diary.stats.activeSeconds)) worked"
         }
-        content.body = "\(diary.headline) · \(DiaryFormat.duration(diary.stats.activeSeconds)) worked"
         content.sound = .default
         content.userInfo = ["dayKey": diary.dayKey]
 

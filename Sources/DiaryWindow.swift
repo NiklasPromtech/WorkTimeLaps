@@ -24,7 +24,15 @@ final class DiaryViewModel: ObservableObject {
     @Published private(set) var diaries: [String: WorkDiary] = [:]
     @Published private(set) var writing: Set<String> = []
     @Published private(set) var errors: [String: String] = [:]
+    @Published private(set) var openFollowUps: [FollowUp] = []
     @Published var selection: String?
+
+    var openFollowUpIDs: Set<String> { Set(openFollowUps.map(\.id)) }
+
+    func setFollowUpDone(_ id: String, _ done: Bool) {
+        FollowUpStore.setDone(id: id, done)
+        openFollowUps = FollowUpStore.open
+    }
 
     private var observers: [NSObjectProtocol] = []
 
@@ -62,6 +70,7 @@ final class DiaryViewModel: ObservableObject {
         days = result
         diaries = loaded
         writing = DiaryScheduler.shared.inProgress
+        openFollowUps = FollowUpStore.open
         if let selection, keys.contains(selection) { return }
         selection = latestKey
     }
@@ -110,7 +119,7 @@ struct DiaryRootView: View {
                     if let diary = model.diaries[key] {
                         DiaryPage(diary: diary, model: model)
                     } else if day.isInProgress {
-                        InProgressPage(day: day)
+                        InProgressPage(day: day, model: model)
                     } else {
                         MissingEntryPage(day: day, model: model)
                     }
@@ -157,9 +166,9 @@ private struct DiarySidebar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Diary")
+                Text("Daily Brief")
                     .font(.system(size: 30, weight: .bold, design: .serif))
-                Text("A page for every day you worked.")
+                Text("Yesterday's diary and a plan for today.")
                     .font(.system(.callout, design: .rounded))
                     .foregroundStyle(.secondary)
             }
@@ -289,6 +298,9 @@ private struct DiaryPage: View {
                 NoticeBanner(symbol: "info.circle.fill", tint: .blue, text: note, showsSettings: !diary.isWrittenByClaude)
             }
             EntryPaper(paragraphs: diary.entry)
+            if let plan = diary.today, !plan.isEmpty {
+                TodaySection(plan: plan, model: model)
+            }
             HStack(alignment: .top, spacing: 18) {
                 if !diary.highlights.isEmpty {
                     HighlightsCard(items: diary.highlights)
@@ -689,11 +701,202 @@ private struct LooseEndsCard: View {
     }
 }
 
+// MARK: - Today
+
+/// The morning brief's plan: focus, meetings to prep for, follow-ups.
+private struct TodaySection: View {
+    let plan: DayPlan
+    @ObservedObject var model: DiaryViewModel
+
+    private var planDate: Date { WorkDay.date(fromKey: plan.dayKey) ?? Date() }
+    private var isToday: Bool { plan.dayKey == WorkDay.key(for: Date()) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                Image(systemName: "sunrise.fill")
+                    .foregroundStyle(Color.orange)
+                Text((isToday ? "TODAY · " : "PLAN FOR ") + DiaryFormat.longDate(planDate).uppercased())
+                    .font(.system(.caption, design: .rounded).weight(.semibold))
+                    .tracking(1.4)
+                    .foregroundStyle(.secondary)
+                Rectangle()
+                    .fill(Color.primary.opacity(0.08))
+                    .frame(height: 1)
+            }
+            .padding(.top, 6)
+
+            if !plan.focus.isEmpty {
+                FocusCard(items: plan.focus)
+            }
+            ForEach(Array(plan.meetings.enumerated()), id: \.offset) { _, meeting in
+                MeetingPrepCard(meeting: meeting)
+            }
+            if !plan.waitingOn.isEmpty || !plan.youOwe.isEmpty {
+                HStack(alignment: .top, spacing: 18) {
+                    if !plan.waitingOn.isEmpty {
+                        FollowUpCard(title: "Waiting on", symbol: "hourglass", items: plan.waitingOn, model: model)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    if !plan.youOwe.isEmpty {
+                        FollowUpCard(title: "You owe", symbol: "arrowshape.turn.up.right", items: plan.youOwe, model: model)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct FocusCard: View {
+    let items: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CardTitle(title: "Focus", symbol: "flag.checkered")
+            ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("\(index + 1)")
+                        .font(.system(.callout, design: .rounded).weight(.bold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 16)
+                    Text(item)
+                        .font(.system(.body, design: .rounded))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(cornerRadius: 16, padding: 18)
+    }
+}
+
+private struct MeetingPrepCard: View {
+    let meeting: DayPlan.MeetingPrep
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(meeting.time)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(meeting.title)
+                        .font(.system(.title3, design: .rounded).weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !meeting.with.isEmpty {
+                        Text("with \(meeting.with)")
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                PrepChip(prepared: meeting.prepared)
+            }
+            if !meeting.context.isEmpty {
+                Text(meeting.context)
+                    .font(.system(.callout, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !meeting.questions.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(Array(meeting.questions.enumerated()), id: \.offset) { _, question in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "questionmark.circle")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.accentColor.opacity(0.8))
+                            Text(question)
+                                .font(.system(.body, design: .rounded))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(cornerRadius: 16, padding: 18)
+    }
+}
+
+private struct PrepChip: View {
+    let prepared: Bool
+
+    var body: some View {
+        let tint: Color = prepared ? Color(red: 0.02, green: 0.59, blue: 0.41) : .orange
+        HStack(spacing: 4) {
+            Image(systemName: prepared ? "checkmark" : "exclamationmark")
+                .font(.system(size: 10, weight: .bold))
+            Text(prepared ? "Prepped" : "Not prepped yet")
+                .font(.system(.caption, design: .rounded).weight(.semibold))
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Capsule(style: .continuous).fill(tint.opacity(0.12)))
+    }
+}
+
+private struct FollowUpCard: View {
+    let title: String
+    let symbol: String
+    let items: [DayPlan.FollowUpItem]
+    @ObservedObject var model: DiaryViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            CardTitle(title: title, symbol: symbol)
+            ForEach(items, id: \.followUpID) { item in
+                let done = !model.openFollowUpIDs.contains(item.followUpID)
+                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                    Button {
+                        model.setFollowUpDone(item.followUpID, !done)
+                    } label: {
+                        Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 15))
+                            .foregroundStyle(done ? Color(red: 0.02, green: 0.59, blue: 0.41) : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(done ? "Mark as open again" : "Mark as done")
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        (Text(item.with).fontWeight(.semibold) + Text(" · \(item.request)"))
+                            .font(.system(.body, design: .rounded))
+                            .strikethrough(done)
+                            .foregroundStyle(done ? .secondary : .primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(detail(item))
+                            .font(.system(.caption, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(cornerRadius: 16, padding: 18)
+    }
+
+    private func detail(_ item: DayPlan.FollowUpItem) -> String {
+        var parts: [String] = []
+        if let since = WorkDay.date(fromKey: item.since) {
+            parts.append("since \(DiaryFormat.shortDate(since))")
+        }
+        if let suggestion = item.suggestion, !suggestion.isEmpty {
+            parts.append(suggestion)
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 // MARK: - Other states
 
-/// Today: the page fills in after the day ends.
+/// Today: the page fills in after the day ends. Meanwhile it shows the
+/// numbers so far and the open follow-ups.
 private struct InProgressPage: View {
     let day: DiaryViewModel.Day
+    @ObservedObject var model: DiaryViewModel
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { _ in
@@ -716,6 +919,21 @@ private struct InProgressPage: View {
                     bigStat("Worked so far", DiaryFormat.duration(cell.totalDuration))
                     bigStat("Started", cell.firstActivity.map(DiaryFormat.time) ?? "—")
                     bigStat("Sessions", "\(cell.sessions.count + (cell.live != nil ? 1 : 0))")
+                }
+
+                let waitingOn = model.openFollowUps.filter(\.isWaitingOnThem).map(DayPlan.FollowUpItem.init)
+                let youOwe = model.openFollowUps.filter { !$0.isWaitingOnThem }.map(DayPlan.FollowUpItem.init)
+                if !waitingOn.isEmpty || !youOwe.isEmpty {
+                    HStack(alignment: .top, spacing: 18) {
+                        if !waitingOn.isEmpty {
+                            FollowUpCard(title: "Waiting on", symbol: "hourglass", items: waitingOn, model: model)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                        if !youOwe.isEmpty {
+                            FollowUpCard(title: "You owe", symbol: "arrowshape.turn.up.right", items: youOwe, model: model)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                    }
                 }
             }
         }
@@ -830,7 +1048,7 @@ final class DiaryWindowController {
 
         let hosting = NSHostingController(rootView: DiaryRootView(model: model))
         let window = NSWindow(contentViewController: hosting)
-        window.title = "Diary"
+        window.title = "Daily Brief"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 1140, height: 840))
         window.center()

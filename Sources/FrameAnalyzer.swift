@@ -42,7 +42,9 @@ struct FrameAnalyzer: Sendable {
     func analyze(image: CGImage,
                  previous: PreviousFrameContext? = nil,
                  vocabulary: [ActivityEntry] = [],
-                 userName: String? = nil) async -> Outcome {
+                 userName: String? = nil,
+                 now: Date = Date(),
+                 extractPlanning: Bool = true) async -> Outcome {
         guard let base64 = Self.encodeAsJPEG(image: image, maxDimension: 1568, quality: 0.7) else {
             return .failed("couldn't encode screenshot as JPEG")
         }
@@ -62,11 +64,13 @@ struct FrameAnalyzer: Sendable {
         // we send below.
         let prompt = Self.buildPrompt(previous: previous,
                                       vocabulary: vocabulary,
-                                      userName: userName)
+                                      userName: userName,
+                                      now: now,
+                                      extractPlanning: extractPlanning)
 
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 480,
+            "max_tokens": 700,
             "messages": [
                 [
                     "role": "user",
@@ -122,9 +126,11 @@ struct FrameAnalyzer: Sendable {
 
     // MARK: - Prompt construction
 
-    private static func buildPrompt(previous: PreviousFrameContext?,
-                                    vocabulary: [ActivityEntry],
-                                    userName: String?) -> String {
+    static func buildPrompt(previous: PreviousFrameContext?,
+                            vocabulary: [ActivityEntry],
+                            userName: String?,
+                            now: Date = Date(),
+                            extractPlanning: Bool = true) -> String {
         // Recent vocabulary block. Empty on a totally fresh install or
         // after a long pause; that's fine — model creates a fresh entry.
         let vocabBlock: String = {
@@ -166,9 +172,58 @@ struct FrameAnalyzer: Sendable {
             .first
             .map(String.init) ?? "the user"
 
+        let clock: String = {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "EEEE yyyy-MM-dd HH:mm"
+            return f.string(from: now)
+        }()
+
+        // Conversations and meetings feed the morning brief's plan for the
+        // day. Left out entirely when the user turns that off.
+        let planningShape = extractPlanning ? """
+        ,
+          "conversation": <null, or {"with": "...", "app": "...", "topic": "...", "lastFrom": "me|them", "request": "...", "requestBy": "me|them|none"}>,
+          "meetings": [<{"title": "...", "start": "YYYY-MM-DDTHH:MM", "with": "..."}>, ...]
+        """ : ""
+
+        let planningRules = extractPlanning ? """
+
+        "conversation": fill ONLY when the frame shows a readable work \
+        conversation the user takes part in: a chat thread, direct message, \
+        email thread or comment thread (Slack, Teams, LinkedIn, email, GitHub \
+        and similar). Otherwise null. ALWAYS null when "privacy" is not "none".
+          - "with": the other person's name as shown, or the channel or group name.
+          - "app": where the conversation is, e.g. "Slack", "LinkedIn", "Gmail".
+          - "topic": what it is about, under 8 words, in English.
+          - "lastFrom": "me" if the most recent visible message was written by \
+        the user, "them" if by someone else.
+          - "request": if the latest messages leave an ask unanswered (someone \
+        asked the other side to reply, decide, send or do something), describe \
+        it as a short action in English with names, e.g. "Peter to get back \
+        about Erik" or "Send Anna the pricing sheet". Empty string if nothing \
+        is waiting.
+          - "requestBy": "me" if the user made the ask (the user is waiting on \
+        them), "them" if the other side asked the user, "none" if "request" \
+        is empty.
+          Messages may be in any language; write "topic" and "request" in English.
+
+        "meetings": upcoming meetings clearly visible on screen: in a \
+        calendar, a meeting invite, or a message confirming a time. Use the \
+        current local time above to resolve words like "tomorrow" or a \
+        weekday. Up to 6, soonest first. Skip meetings that have already ended \
+        and all-day events. Empty array when none are visible, and always \
+        empty when "privacy" is not "none".
+          - "title": the meeting's title.
+          - "start": local start time as YYYY-MM-DDTHH:MM.
+          - "with": attendee or organizer names if shown, otherwise empty string.
+        """ : ""
+
         return """
         You are analyzing a screen-recording frame for a local macOS tool. \
         Output JSON and nothing else — no prose, no markdown fences.
+
+        Current local time: \(clock).
 
         \(userBlock)
 
@@ -187,7 +242,7 @@ struct FrameAnalyzer: Sendable {
           "sameAsBefore": <boolean>,
           "recognitionLevel": "<one of: none|weak|specific|major>",
           "recognitionQuote": "<the quoted praise text, or empty string>",
-          "recognitionSpeaker": "<who said it, or empty string>"
+          "recognitionSpeaker": "<who said it, or empty string>"\(planningShape)
         }
 
         Field rules:
@@ -331,6 +386,7 @@ struct FrameAnalyzer: Sendable {
 
         When in doubt: "none". Most frames are "none". The user wants \
         to trust this list.
+        \(planningRules)
 
         JSON only. No explanations.
         """
@@ -338,7 +394,7 @@ struct FrameAnalyzer: Sendable {
 
     // MARK: - JSON parsing
 
-    private func parseAnalysisJSON(_ raw: String) -> Outcome {
+    func parseAnalysisJSON(_ raw: String) -> Outcome {
         // Models sometimes wrap JSON in ```json … ``` despite instructions.
         // Strip that before parsing.
         let cleaned = Self.stripCodeFence(raw)
@@ -394,6 +450,15 @@ struct FrameAnalyzer: Sendable {
         let recognitionSpeaker = ((obj["recognitionSpeaker"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Planning signals. Optional and never fail-closed; dropped for
+        // frames tagged private, whatever the model returned.
+        var conversation: ConversationSnapshot?
+        var meetings: [MeetingMention] = []
+        if privacy == .none {
+            conversation = Self.parseConversation(obj["conversation"])
+            meetings = Self.parseMeetings(obj["meetings"])
+        }
+
         return .analyzed(FrameAnalysis(
             safe: safe,
             category: category,
@@ -404,8 +469,45 @@ struct FrameAnalyzer: Sendable {
             sameAsBefore: sameAsBefore,
             recognitionLevel: recognitionLevel,
             recognitionQuote: recognitionQuote,
-            recognitionSpeaker: recognitionSpeaker
+            recognitionSpeaker: recognitionSpeaker,
+            conversation: conversation,
+            meetings: meetings
         ))
+    }
+
+    private static func text(_ value: Any?) -> String {
+        ((value as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func party(_ value: Any?) -> String? {
+        let raw = text(value).lowercased()
+        return raw == "me" || raw == "them" ? raw : nil
+    }
+
+    static func parseConversation(_ value: Any?) -> ConversationSnapshot? {
+        guard let c = value as? [String: Any] else { return nil }
+        let with = text(c["with"])
+        guard !with.isEmpty else { return nil }
+        let request = text(c["request"])
+        return ConversationSnapshot(
+            with: with,
+            app: text(c["app"]).isEmpty ? nil : text(c["app"]),
+            topic: text(c["topic"]),
+            lastFrom: party(c["lastFrom"]),
+            request: request.isEmpty ? nil : request,
+            requestBy: request.isEmpty ? nil : party(c["requestBy"])
+        )
+    }
+
+    static func parseMeetings(_ value: Any?) -> [MeetingMention] {
+        guard let list = value as? [[String: Any]] else { return [] }
+        return list.prefix(6).compactMap { m in
+            let title = text(m["title"])
+            let start = text(m["start"])
+            guard !title.isEmpty, !start.isEmpty else { return nil }
+            let with = text(m["with"])
+            return MeetingMention(title: title, start: start, with: with.isEmpty ? nil : with)
+        }
     }
 
     private static func stripCodeFence(_ raw: String) -> String {
