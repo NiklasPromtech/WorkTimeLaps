@@ -1,13 +1,12 @@
 import Foundation
 
 /// On-disk sidecar for a single recording. Written next to the MP4 as
-/// `<stem>.json` and rewritten atomically after every frame so a crash or
-/// power loss during a multi-hour session still leaves a readable record of
-/// what was captured up to that point.
+/// `<stem>.json`, rewritten atomically about once a minute while recording
+/// and again when the session ends, so a crash or power loss still leaves a
+/// readable record of what was captured.
 ///
-/// Keep the schema additive — older sidecars must stay decodable as the
-/// reviewer tooling evolves. That's why almost every non-identity field
-/// outside `frames` is optional.
+/// Keep the schema additive — older sidecars must stay decodable. That's
+/// why almost every non-identity field outside `frames` is optional.
 struct RecordingSession: Codable, Sendable {
 
     /// Stable identifier. Shared across `video`, the sidecar JSON, and the
@@ -15,14 +14,15 @@ struct RecordingSession: Codable, Sendable {
     let id: String
 
     /// Filename (not full path) of the MP4 this sidecar describes. Keeps the
-    /// JSON portable — move the folder, the pairing still holds.
+    /// JSON portable — move the folder, the pairing still holds. The MP4
+    /// itself is deleted after the video retention period; the sidecar stays.
     let video: String
 
     let startedAt: Date
     var endedAt: Date?
 
-    /// Updated in-place each time we append a frame, so a crashed session
-    /// still has a meaningful "last heard from" timestamp on disk.
+    /// Updated whenever the sidecar is written, so a crashed session still
+    /// has a meaningful "last heard from" timestamp on disk.
     var lastUpdated: Date
 
     let captureIntervalSec: Double
@@ -36,8 +36,8 @@ struct RecordingSession: Codable, Sendable {
 
     var frames: [FrameEntry] = []
 
-    /// Populated once at stop time. Gives reviewers a fast summary without
-    /// walking the full `frames` array.
+    /// Populated when the session ends. Gives readers a fast summary
+    /// without walking the full `frames` array.
     var summary: SessionSummary?
 }
 
@@ -54,20 +54,20 @@ struct FrameEntry: Codable, Sendable {
     let engagementSmoothed: Int
     let redacted: Bool
 
-    /// Filled only when `redacted == true`. e.g. "secret visible" vs.
-    /// "analyzer failed: network". Lets the reviewer tell a genuine leak
-    /// flag from an outage-driven fail-closed.
+    /// Filled only when `redacted == true`: "secret visible",
+    /// "privacy:financial", "blocked:app:<bundle id>", "blocked:self" or
+    /// "analyzer failed: …". Tells a genuine leak flag from a user rule
+    /// or an outage-driven fail-closed.
     let redactionReason: String?
 
-    /// If the previous capture was >3× the configured interval ago we mark
-    /// the gap here and force engagement to 0. Distinguishes "user was idle"
-    /// from "laptop was asleep" when skimming sessions later.
+    /// Set when the previous frame was long enough ago that the user was
+    /// away (Mac asleep, screen locked, recording paused). Engagement is
+    /// forced to 0 on such a frame.
     let sleepGapSec: Double?
 
     /// Granular, free-text activity label drawn from the rolling 2-hour
-    /// vocabulary. Drives the activity-stream view in the Journal.
-    /// Optional + added late so older sidecars from before Phase 9 still
-    /// decode; missing → "" → activity-stream falls back to category.
+    /// vocabulary. Optional because older sidecars predate it; readers fall
+    /// back to the category name.
     var activity: String?
 }
 
@@ -81,40 +81,49 @@ struct SessionSummary: Codable, Sendable {
     let averageEngagement: Int
     let topCategory: FrameCategory
     let categoryCounts: [String: Int]
+
+    /// Time actually spent recording, with absences left out. Optional
+    /// because older sidecars predate it.
+    var activeSeconds: Double?
+
+    static func make(frames: [FrameEntry], captureInterval: TimeInterval) -> SessionSummary {
+        let total = frames.count
+        let redacted = frames.filter { $0.redacted }.count
+
+        var counts: [String: Int] = [:]
+        var engagementSum = 0
+        for f in frames {
+            counts[f.category.rawValue, default: 0] += 1
+            engagementSum += f.engagementSmoothed
+        }
+        let avg = total == 0 ? 0 : Int((Double(engagementSum) / Double(total)).rounded())
+        let top = counts.max(by: { $0.value < $1.value })?.key ?? FrameCategory.other.rawValue
+
+        return SessionSummary(
+            totalFrames: total,
+            safeFrames: total - redacted,
+            redactedFrames: redacted,
+            averageEngagement: avg,
+            topCategory: FrameCategory(rawValue: top) ?? .other,
+            categoryCounts: counts,
+            activeSeconds: ActivityTimeline.activeSeconds(frames, captureInterval: captureInterval)
+        )
+    }
 }
 
-/// Atomic, crash-safe writer for `RecordingSession` sidecars.
+/// Atomic, crash-safe reader/writer for `RecordingSession` sidecars.
 ///
-/// Uses `.atomic` writes (write-to-tempfile + rename) so the on-disk JSON
-/// is never observed half-written, even if the process is killed mid-write.
-/// Called after every frame append, so it has to be cheap — the sessions
-/// we care about are ~hundreds to low thousands of frames long, so
-/// rewriting the whole blob each time is still under a millisecond.
+/// `.atomic` writes (temp file + rename) mean the JSON is never observed
+/// half-written. Output is compact because a full day's sidecar runs to
+/// a few MB and is rewritten repeatedly while recording.
 enum SessionWriter {
 
-    /// Shared encoder. ISO-8601 dates are human-readable in the JSON and
-    /// round-trip correctly; sorted + pretty output makes git-diffs and
-    /// manual inspection usable.
-    private static let encoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.dateEncodingStrategy = .iso8601
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return e
-    }()
-
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
-
     static func write(_ session: RecordingSession, to url: URL) throws {
-        let data = try encoder.encode(session)
-        try data.write(to: url, options: .atomic)
+        try JSONFile.write(session, to: url, encoder: JSONFile.compactEncoder)
     }
 
     static func read(from url: URL) throws -> RecordingSession {
         let data = try Data(contentsOf: url)
-        return try decoder.decode(RecordingSession.self, from: data)
+        return try JSONFile.decoder.decode(RecordingSession.self, from: data)
     }
 }

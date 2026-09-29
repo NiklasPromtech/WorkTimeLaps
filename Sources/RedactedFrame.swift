@@ -2,7 +2,8 @@ import Cocoa
 import CoreGraphics
 
 /// Generates a near-black "REDACTED" placeholder CGImage the same size as the
-/// real screenshot. Used when SafetyChecker flags a frame (or fails closed).
+/// real screenshot. Used for frames that show a secret, match a privacy
+/// filter or blocked app, or couldn't be checked (fail-closed).
 ///
 /// Rendering a CGImage each frame would be wasteful — the redaction image
 /// doesn't depend on the screenshot contents, only on its dimensions. We
@@ -60,7 +61,7 @@ enum RedactedFrame {
 
         let subtitleFont = NSFont.systemFont(ofSize: fontSize * 0.35, weight: .regular)
         let subtitle = NSAttributedString(
-            string: "WorkTimeLaps hid this frame because it looked like it contained a secret.",
+            string: "WorkTimeLaps kept this frame out of the video to protect your privacy.",
             attributes: [
                 .font: subtitleFont,
                 .foregroundColor: NSColor(white: 0.7, alpha: 1.0),

@@ -12,7 +12,91 @@ import UniformTypeIdentifiers
 /// state here.
 @MainActor
 final class SettingsViewModel: ObservableObject {
-    init() {}
+
+    private var observers: [NSObjectProtocol] = []
+
+    init() {
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .worktimelapsAPIKeyChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.objectWillChange.send() }
+        })
+    }
+
+    // MARK: Recording
+
+    var launchAtLogin: Bool {
+        get { LoginItem.isEnabled }
+        set {
+            objectWillChange.send()
+            LoginItem.setEnabled(newValue)
+        }
+    }
+
+    var loginItemNeedsApproval: Bool { LoginItem.needsApproval }
+
+    var autoStartRecording: Bool {
+        get { Preferences.autoStartRecording }
+        set {
+            objectWillChange.send()
+            Preferences.autoStartRecording = newValue
+        }
+    }
+
+    var retentionHours: Int {
+        get { RetentionSweeper.retentionHours }
+        set {
+            objectWillChange.send()
+            RetentionSweeper.retentionHours = newValue
+            // Apply right away so a shorter period frees space now.
+            DiaryScheduler.shared.sweepExpiredVideo()
+        }
+    }
+
+    // MARK: Work diary
+
+    var cutoffHour: Int {
+        get { WorkDay.cutoffHour }
+        set {
+            objectWillChange.send()
+            WorkDay.cutoffHour = newValue
+        }
+    }
+
+    var notificationTime: Date {
+        get {
+            var c = DateComponents()
+            c.hour = Preferences.diaryNotificationHour
+            c.minute = Preferences.diaryNotificationMinute
+            return Calendar.current.date(from: c) ?? Date()
+        }
+        set {
+            objectWillChange.send()
+            let c = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+            Preferences.diaryNotificationHour = c.hour ?? 9
+            Preferences.diaryNotificationMinute = c.minute ?? 0
+        }
+    }
+
+    var writeDiaryWithClaude: Bool {
+        get { Preferences.writeDiaryWithClaude }
+        set {
+            objectWillChange.send()
+            Preferences.writeDiaryWithClaude = newValue
+        }
+    }
+
+    // MARK: API key
+
+    var apiKeyFingerprint: String? { APIKeyStore.load().map(APIKeyStore.fingerprint) }
+
+    func changeAPIKey() {
+        APIKeyPrompt.run()
+    }
+
+    func removeAPIKey() {
+        APIKeyStore.clear()
+    }
 
     // MARK: Privacy filters
 
@@ -23,28 +107,7 @@ final class SettingsViewModel: ObservableObject {
         PrivacyFilterStore.setEnabled(tag, on)
     }
 
-    // MARK: Storage quota
-
-    /// Menu options in bytes. 0 = unlimited.
-    static let quotaOptions: [(label: String, bytes: Int64)] = [
-        ("5 GB",       5  * 1024 * 1024 * 1024),
-        ("10 GB",      10 * 1024 * 1024 * 1024),
-        ("25 GB",      25 * 1024 * 1024 * 1024),
-        ("50 GB",      50 * 1024 * 1024 * 1024),
-        ("Unlimited",  0)
-    ]
-
-    var quotaBytes: Int64 {
-        get { RetentionSweeper.quotaBytes }
-        set {
-            objectWillChange.send()
-            RetentionSweeper.setQuotaBytes(newValue)
-            // Apply immediately so a shrunk cap prunes right away.
-            RetentionSweeper.sweep()
-        }
-    }
-
-    // MARK: Recordings folder
+    // MARK: Data folder
 
     var recordingsFolder: URL { TimeLapseRecorder.recordingsFolder }
 
@@ -69,12 +132,11 @@ final class SettingsViewModel: ObservableObject {
     }
 
     /// Opens NSOpenPanel rooted at /Applications and lets the user pick an
-    /// .app bundle. We read its `CFBundleIdentifier` and `CFBundleName` so
-    /// the new rule has both the technical match string and a friendly
-    /// label for the UI.
+    /// .app bundle. We read its `CFBundleIdentifier` and name so the new
+    /// rule has both the match string and a friendly label.
     func addAppRuleViaPicker() {
         let panel = NSOpenPanel()
-        panel.title = "Pick an app to never record from"
+        panel.title = "Pick an app to never send or record"
         panel.allowedContentTypes = [UTType.application]
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         panel.canChooseDirectories = false
@@ -89,9 +151,6 @@ final class SettingsViewModel: ObservableObject {
             ?? url.deletingPathExtension().lastPathComponent
 
         guard let id = bundleID, !id.isEmpty else {
-            // Couldn't read a bundle id (rare — corrupted bundle, or a
-            // wrapper without an Info.plist). Surface a small alert so the
-            // user knows nothing happened.
             let alert = NSAlert()
             alert.messageText = "Couldn't read that app's bundle identifier."
             alert.informativeText = "Try a different app, or add a window-title rule instead."
@@ -103,9 +162,8 @@ final class SettingsViewModel: ObservableObject {
         PrivacyRulesStore.add(PrivacyRule(kind: .app, pattern: id, label: displayName))
     }
 
-    /// Adds a window-title (substring) rule. Trimmed; empty input is
-    /// silently ignored so an accidental empty save doesn't insert a
-    /// universal-match rule that would redact every frame.
+    /// Adds a window-title (substring) rule. Empty input is ignored so an
+    /// accidental empty save can't insert a rule that matches every frame.
     func addWindowTitleRule(pattern: String, label: String) {
         let trimmedPattern = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPattern.isEmpty else { return }
@@ -123,12 +181,33 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 26) {
                 header
 
                 section(
+                    title: "Recording",
+                    subtitle: "WorkTimeLaps captures a screenshot every 10 seconds and pauses by itself while your screen is locked or your Mac is asleep."
+                ) {
+                    RecordingSettings(model: model)
+                }
+
+                section(
+                    title: "Work diary",
+                    subtitle: "Each work day ends at the time below, so late nights count toward the day they started. The diary is written after the day ends and announced the next morning."
+                ) {
+                    DiarySettings(model: model)
+                }
+
+                section(
+                    title: "Anthropic API key",
+                    subtitle: "Screenshots are labeled by Claude Haiku 4.5 (roughly half a cent each, about $10 for an 8-hour day). Diary entries are written by Claude Opus 5.5 from the day's text log (about $0.10 a day). The key is stored in your keychain."
+                ) {
+                    APIKeySettings(model: model)
+                }
+
+                section(
                     title: "Privacy filters",
-                    subtitle: "Frames matching an enabled tag have their image replaced with a REDACTED placeholder in the MP4. The sidecar log still records the category and a generic activity summary."
+                    subtitle: "Frames that Claude tags with an enabled category are replaced with a REDACTED placeholder in the video. The log keeps the category and a generic summary."
                 ) {
                     ForEach(PrivacyTag.selectable, id: \.rawValue) { tag in
                         PrivacyToggleRow(model: model, tag: tag)
@@ -136,27 +215,14 @@ struct SettingsView: View {
                 }
 
                 section(
-                    title: "Apps and windows to redact",
-                    subtitle: "Frames captured while one of these apps is in front, or while the frontmost window's title contains the matching text, are replaced with a REDACTED placeholder. The analyzer still runs so the category and engagement are still logged — only the image and specific summary are scrubbed."
+                    title: "Apps and windows to block",
+                    subtitle: "While one of these apps is in front, or the front window's title contains the text, screenshots are never sent to Claude and the video shows a REDACTED placeholder. The log records only a generic label."
                 ) {
                     PrivacyRulesSection(model: model)
                 }
 
                 section(
-                    title: "Storage cap",
-                    subtitle: "Maximum total size of saved MP4s. Oldest recordings are pruned first when the cap is exceeded. The daily journal under _journal/ is never pruned."
-                ) {
-                    Picker("Maximum size", selection: quotaBinding) {
-                        ForEach(SettingsViewModel.quotaOptions, id: \.bytes) { opt in
-                            Text(opt.label).tag(opt.bytes)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                }
-
-                section(
-                    title: "Recordings folder",
+                    title: "Data folder",
                     subtitle: model.recordingsFolder.path
                 ) {
                     Button("Reveal in Finder") {
@@ -165,27 +231,18 @@ struct SettingsView: View {
                 }
             }
             .padding(24)
-            .frame(maxWidth: 560, alignment: .leading)
+            .frame(maxWidth: 580, alignment: .leading)
         }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("WorkTimeLaps")
+            Text("Settings")
                 .font(.title2).bold()
-            Text("Settings apply immediately — no restart needed.")
+            Text("Changes apply immediately.")
                 .font(.callout)
                 .foregroundColor(.secondary)
         }
-    }
-
-    // MARK: Helpers
-
-    private var quotaBinding: Binding<Int64> {
-        Binding(
-            get: { model.quotaBytes },
-            set: { model.quotaBytes = $0 }
-        )
     }
 
     @ViewBuilder
@@ -206,6 +263,123 @@ struct SettingsView: View {
                 .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - Recording, diary and key sections
+
+private struct RecordingSettings: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Open WorkTimeLaps at login", isOn: Binding(
+                get: { model.launchAtLogin },
+                set: { model.launchAtLogin = $0 }
+            ))
+            if model.loginItemNeedsApproval {
+                HStack(spacing: 6) {
+                    Text("Approve WorkTimeLaps under Login Items to finish setting this up.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Button("Open Login Items") { LoginItem.openSystemSettings() }
+                        .controlSize(.small)
+                }
+            }
+            Toggle("Start recording when WorkTimeLaps opens", isOn: Binding(
+                get: { model.autoStartRecording },
+                set: { model.autoStartRecording = $0 }
+            ))
+
+            HStack(spacing: 12) {
+                Text("Keep video for")
+                Picker("Keep video for", selection: Binding(
+                    get: { model.retentionHours },
+                    set: { model.retentionHours = $0 }
+                )) {
+                    ForEach(RetentionSweeper.options, id: \.hours) { option in
+                        Text(option.label).tag(option.hours)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 320)
+            }
+            .padding(.top, 4)
+            Text("Older videos and thumbnails are deleted automatically. The activity log, journal, diaries and highlights are text and are kept.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct DiarySettings: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Text("Day ends at")
+                Picker("Day ends at", selection: Binding(
+                    get: { model.cutoffHour },
+                    set: { model.cutoffHour = $0 }
+                )) {
+                    ForEach(Array(WorkDay.allowedCutoffHours), id: \.self) { hour in
+                        Text(Self.hourLabel(hour)).tag(hour)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 130)
+            }
+            HStack(spacing: 12) {
+                Text("Notify me at")
+                DatePicker("Notify me at", selection: Binding(
+                    get: { model.notificationTime },
+                    set: { model.notificationTime = $0 }
+                ), displayedComponents: .hourAndMinute)
+                .labelsHidden()
+            }
+            Toggle("Have Claude write the entry", isOn: Binding(
+                get: { model.writeDiaryWithClaude },
+                set: { model.writeDiaryWithClaude = $0 }
+            ))
+            Text("When off, or without an API key, the diary is assembled on your Mac from the day's numbers and longest stretches.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    static func hourLabel(_ hour: Int) -> String {
+        if hour == 0 { return "Midnight" }
+        var c = DateComponents()
+        c.hour = hour
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return Calendar.current.date(from: c).map { f.string(from: $0) } ?? "\(hour):00"
+    }
+}
+
+private struct APIKeySettings: View {
+    @ObservedObject var model: SettingsViewModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let fingerprint = model.apiKeyFingerprint {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                Text("Key saved (\(fingerprint))")
+                Spacer()
+                Button("Change…") { model.changeAPIKey() }
+                Button("Remove") { model.removeAPIKey() }
+            } else {
+                Image(systemName: "exclamationmark.circle.fill").foregroundColor(.orange)
+                Text("No key — screenshots won't be labeled or checked for secrets")
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Add Key…") { model.changeAPIKey() }
+            }
+        }
     }
 }
 
@@ -389,9 +563,9 @@ final class SettingsWindowController {
 
         let hosting = NSHostingController(rootView: SettingsView(model: model))
         let window = NSWindow(contentViewController: hosting)
-        window.title = "WorkTimeLaps Settings"
+        window.title = "Settings"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 620, height: 720))
+        window.setContentSize(NSSize(width: 640, height: 780))
         window.center()
         window.isReleasedWhenClosed = false   // so we can reopen without crashing
 

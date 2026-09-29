@@ -19,14 +19,11 @@ enum PrivacyRuleKind: String, Codable, Sendable, CaseIterable {
 }
 
 /// One blocklist entry. Frames captured while the rule matches the current
-/// foreground context have their *image* replaced with the REDACTED
-/// placeholder, but the analyzer still runs and the category + engagement
-/// still get logged — so daily totals like "X% of the day chatting" stay
-/// accurate even without the visual evidence.
-///
-/// The summary text is sanitized down to the category display name on a
-/// blocked frame, so a Telegram DM doesn't leak via the sidecar's
-/// `summary` field.
+/// foreground context are never sent to Claude and are written to the
+/// video as a REDACTED placeholder. The frame is still logged — with a
+/// category guessed from the rule and the category name as its summary —
+/// so daily totals like "X% of the day chatting" stay accurate without any
+/// content leaving the Mac or landing in the log.
 struct PrivacyRule: Codable, Sendable, Identifiable, Equatable {
     var id: UUID
     var kind: PrivacyRuleKind
@@ -138,6 +135,29 @@ enum PrivacyRulesStore {
             }
         }
         return nil
+    }
+
+    /// Category logged for frames a rule blocks. Blocked frames never reach
+    /// the analyzer, so this is what keeps an hour in Signal counted as chat
+    /// time in the journal and the diary.
+    static func category(for rule: PrivacyRule) -> FrameCategory {
+        switch rule.pattern.lowercased() {
+        case "com.apple.mobilesms",
+             "org.whispersystems.signal-desktop",
+             "ru.keepcoder.telegram",
+             "org.telegram.desktop",
+             "net.whatsapp.whatsapp",
+             "com.hnc.discord",
+             "com.tinyspeck.slackmacgap",
+             "com.microsoft.teams2":
+            return .chat
+        case "com.apple.facetime", "us.zoom.xos":
+            return .meeting
+        case "com.apple.mail", "com.microsoft.outlook":
+            return .email
+        default:
+            return .other
+        }
     }
 
     // MARK: - Private

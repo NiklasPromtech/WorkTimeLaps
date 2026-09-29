@@ -13,6 +13,11 @@ enum RecognitionLevel: String, Codable, Sendable, CaseIterable, Comparable {
     case specific   // names the contribution ("the analysis you did saved us a week")
     case major      // unmistakable ("this was outstanding work, exactly what we needed")
 
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = RecognitionLevel(rawValue: raw.lowercased()) ?? .none
+    }
+
     var display: String {
         switch self {
         case .none:     return "—"
@@ -39,10 +44,9 @@ enum RecognitionLevel: String, Codable, Sendable, CaseIterable, Comparable {
 }
 
 /// One captured "moment of recognition" — the atomic record the brag
-/// sheet is built from. Stored append-only in
-/// `~/Movies/WorkTimeLaps/_journal/recognitions.json` and *never*
-/// pruned. MP4s and per-session sidecars can roll off under the size
-/// quota; the recognition log is the long-term receipt store.
+/// sheet is built from. Stored in `<data folder>/_journal/recognitions.json`
+/// and *never* pruned: videos roll off after the retention period, but
+/// the recognition log is the long-term receipt store.
 ///
 /// Schema is deliberately conservative — most non-identity fields are
 /// optional so the analyzer can return what it can and we don't lose
@@ -100,6 +104,22 @@ struct Recognition: Codable, Sendable, Identifiable {
     /// strips leading/trailing whitespace and reduces any internal
     /// run of whitespace to a single space. Empty strings → nil so
     /// the dashboard skips entries without an attributed speaker.
+    func withLevel(_ newLevel: RecognitionLevel) -> Recognition {
+        Recognition(
+            id: id,
+            capturedAt: capturedAt,
+            level: newLevel,
+            quote: quote,
+            speaker: speaker,
+            sourceAppBundleID: sourceAppBundleID,
+            sourceAppName: sourceAppName,
+            activity: activity,
+            category: category,
+            sessionID: sessionID,
+            frameIndex: frameIndex
+        )
+    }
+
     func normalizingSpeaker() -> Recognition {
         guard let raw = speaker else { return self }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -130,41 +150,45 @@ extension Notification.Name {
     static let worktimelapsRecognitionAppended = Notification.Name("WorkTimeLaps.recognitionAppended")
 }
 
-/// Append-only store for recognitions. Mirrors the shape of `Journal`
-/// — file under `_journal/`, atomic writes, JSONEncoder with
-/// `.iso8601` dates and pretty/sorted output for diff-friendliness.
+/// Append-only store for recognitions. File under `_journal/`, atomic
+/// writes, ISO-8601 dates, pretty output for diff-friendliness.
 enum RecognitionStore {
 
-    /// Lives under `_journal/` so it survives storage-cap pruning. The
-    /// journal directory is created on demand by `Journal.folder`.
+    /// Lives under `_journal/` so it's never touched by video retention.
     static var fileURL: URL {
         Journal.folder.appendingPathComponent("recognitions.json")
     }
 
     // MARK: - Writing
 
-    /// Append one recognition to disk. Read-modify-write because the
-    /// file is small (a year of even prolific recognition is single
-    /// digits of MB) and atomic writes are simpler than maintaining
-    /// a multi-file index.
+    /// Append one recognition. The same compliment usually stays on screen
+    /// for several frames (and gets re-read later), so a quote matching one
+    /// already captured in the previous 24 hours is merged into it rather
+    /// than added again — keeping the stronger level.
     ///
-    /// Speaker name is normalized on the way in (trimmed, runs of
-    /// internal whitespace collapsed) so trivial dupes from OCR jitter
-    /// don't fragment the Top Voices list. We don't try to fuzzy-merge
-    /// genuine spelling drift ("Tchuindjang" vs "Tchundjang") here —
-    /// that's a future enhancement; for now those would each get their
-    /// own row.
+    /// Speaker names are normalized on the way in (trimmed, whitespace
+    /// collapsed) so OCR jitter doesn't fragment the Top Voices list.
     static func append(_ rec: Recognition) {
-        var existing = loadAll()
-        let cleaned = rec.normalizingSpeaker()
-        // Skip duplicates — analyzer can fire repeatedly on the same
-        // visible quote across consecutive frames. We dedupe on
-        // (sessionID, frameIndex) when both are present, falling back
-        // to (capturedAt, quote) otherwise.
-        if existing.contains(where: { isSameMoment($0, cleaned) }) {
-            return
+        var existing: [Recognition]
+        switch readFile() {
+        case .missing:
+            existing = []
+        case .value(let entries):
+            existing = entries
+        case .unreadable(let error):
+            // Never replace an unreadable history with a one-entry list.
+            NSLog("WorkTimeLaps: recognitions.json is unreadable (\(error.localizedDescription))")
+            JSONFile.quarantine(fileURL)
+            existing = []
         }
-        existing.append(cleaned)
+
+        let cleaned = rec.normalizingSpeaker()
+        if let idx = existing.firstIndex(where: { isDuplicate($0, cleaned) }) {
+            guard cleaned.level > existing[idx].level else { return }
+            existing[idx] = existing[idx].withLevel(cleaned.level)
+        } else {
+            existing.append(cleaned)
+        }
         do {
             try write(existing)
             postUpdate()
@@ -173,36 +197,73 @@ enum RecognitionStore {
         }
     }
 
-    private static func isSameMoment(_ a: Recognition, _ b: Recognition) -> Bool {
-        if let aIdx = a.frameIndex, let bIdx = b.frameIndex,
-           let aSes = a.sessionID, let bSes = b.sessionID {
-            return aSes == bSes && aIdx == bIdx
+    // MARK: - Duplicate detection
+
+    /// Lowercased letters, digits and single spaces only.
+    static func normalizedQuote(_ s: String) -> String {
+        let scalars = s.lowercased().unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
+        return String(scalars).split(separator: " ").joined(separator: " ")
+    }
+
+    /// True when two quotes are the same compliment captured twice: equal
+    /// after normalization, one containing the other (the model trimmed a
+    /// greeting differently), or at least 80 % word overlap.
+    static func isSameQuote(_ a: String, _ b: String) -> Bool {
+        let na = normalizedQuote(a)
+        let nb = normalizedQuote(b)
+        guard !na.isEmpty, !nb.isEmpty else { return false }
+        if na == nb { return true }
+        let (shorter, longer) = na.count <= nb.count ? (na, nb) : (nb, na)
+        if shorter.count >= 20 && longer.contains(shorter) { return true }
+        let wa = Set(na.split(separator: " "))
+        let wb = Set(nb.split(separator: " "))
+        let union = wa.union(wb).count
+        return union > 0 && Double(wa.intersection(wb).count) / Double(union) >= 0.8
+    }
+
+    static func isDuplicate(_ a: Recognition, _ b: Recognition) -> Bool {
+        abs(a.capturedAt.timeIntervalSince(b.capturedAt)) < 24 * 3600 && isSameQuote(a.quote, b.quote)
+    }
+
+    /// Collapses duplicates, keeping the earliest sighting at the strongest
+    /// level. Applied on read, so history captured before duplicate
+    /// detection existed displays correctly too.
+    static func deduplicated(_ entries: [Recognition]) -> [Recognition] {
+        var kept: [Recognition] = []
+        for rec in entries.sorted(by: { $0.capturedAt < $1.capturedAt }) {
+            if let idx = kept.firstIndex(where: { isDuplicate($0, rec) }) {
+                if rec.level > kept[idx].level {
+                    kept[idx] = kept[idx].withLevel(rec.level)
+                }
+            } else {
+                kept.append(rec)
+            }
         }
-        return abs(a.capturedAt.timeIntervalSince(b.capturedAt)) < 1.0
-            && a.quote == b.quote
+        return kept
     }
 
     // MARK: - Reading
 
-    /// Returns every recognition on disk, ordered most recent first.
-    /// Cheap as long as the file is reasonable-sized — we'll add
-    /// indexing if a power user crosses tens of thousands of entries.
+    /// Every recognition, deduplicated, most recent first.
     static func loadAll() -> [Recognition] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        let entries = (try? decoder.decode([Recognition].self, from: data)) ?? []
-        return entries.sorted(by: { $0.capturedAt > $1.capturedAt })
+        guard case .value(let entries) = readFile() else { return [] }
+        return deduplicated(entries).sorted(by: { $0.capturedAt > $1.capturedAt })
     }
 
-    /// Recognitions captured within the given closed-open range.
-    /// Used by the Highlights view's period selector ("last 30 days",
-    /// "this month", custom).
+    /// Recognitions captured within [start, end).
     static func loadInPeriod(from start: Date, to end: Date) -> [Recognition] {
         loadAll().filter { $0.capturedAt >= start && $0.capturedAt < end }
     }
 
-    /// Returns top speakers in the period, sorted by weighted count
-    /// (level.weight summed). The top entries are the people whose
-    /// quotes you'd put on the brag sheet first.
+    /// Recognitions captured during the work day named by `dayKey`.
+    static func load(workDay dayKey: String) -> [Recognition] {
+        guard let interval = WorkDay.interval(forKey: dayKey) else { return [] }
+        return loadInPeriod(from: interval.start, to: interval.end)
+            .sorted(by: { $0.capturedAt < $1.capturedAt })
+    }
+
+    /// Top speakers in the period, sorted by weighted count (level.weight
+    /// summed) — the people you'd quote on the brag sheet first.
     static func topSpeakers(in period: ClosedRange<Date>, limit: Int = 8) -> [(speaker: String, weight: Int, count: Int)] {
         let entries = loadInPeriod(from: period.lowerBound, to: period.upperBound)
         var weighted: [String: (weight: Int, count: Int)] = [:]
@@ -220,10 +281,8 @@ enum RecognitionStore {
             .map { $0 }
     }
 
-    /// Counts grouped by activity (the tool/task vocabulary) so the
-    /// dashboard can answer "which projects produced the most
-    /// recognition." Unknown/missing activity is bucketed into
-    /// "Other" so it still shows up.
+    /// Counts grouped by activity, so the dashboard can answer "which
+    /// projects produced the most recognition". Missing activity → "Other".
     static func recognitionByActivity(in period: ClosedRange<Date>) -> [(activity: String, weight: Int, count: Int)] {
         let entries = loadInPeriod(from: period.lowerBound, to: period.upperBound)
         var weighted: [String: (weight: Int, count: Int)] = [:]
@@ -239,14 +298,13 @@ enum RecognitionStore {
             .sorted(by: { $0.weight > $1.weight })
     }
 
-    // MARK: - Editing (future-friendly)
+    // MARK: - Editing
 
-    /// Removes a single recognition by id. Used by future "this was
-    /// noise, hide it" UI; ships disabled in v1 but the plumbing is
-    /// there so we don't have to migrate later.
+    /// Removes a single recognition by id (for a future "this was noise"
+    /// action).
     @discardableResult
     static func remove(id: String) -> Bool {
-        var existing = loadAll()
+        guard case .value(var existing) = readFile() else { return false }
         let before = existing.count
         existing.removeAll { $0.id == id }
         guard existing.count != before else { return false }
@@ -262,27 +320,21 @@ enum RecognitionStore {
 
     // MARK: - Disk I/O
 
-    private static func write(_ entries: [Recognition]) throws {
-        // Persist in chronological order so a manual `cat` reads
-        // naturally. Sorted-keys + pretty output keeps git diffs sane
-        // if anyone backs the folder up to version control.
-        let chronological = entries.sorted(by: { $0.capturedAt < $1.capturedAt })
-        let data = try encoder.encode(chronological)
-        try data.write(to: fileURL, options: .atomic)
+    /// Entries that fail to decode are dropped individually rather than
+    /// failing the whole file.
+    private static func readFile() -> JSONFile.ReadResult<[Recognition]> {
+        switch JSONFile.read(LossyArray<Recognition>.self, from: fileURL) {
+        case .missing: return .missing
+        case .unreadable(let error): return .unreadable(error)
+        case .value(let lossy): return .value(lossy.elements)
+        }
     }
 
-    private static let encoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.dateEncodingStrategy = .iso8601
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return e
-    }()
-
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
+    /// Persisted in chronological order so a manual `cat` reads naturally.
+    private static func write(_ entries: [Recognition]) throws {
+        let chronological = entries.sorted(by: { $0.capturedAt < $1.capturedAt })
+        try JSONFile.write(chronological, to: fileURL)
+    }
 
     private static func postUpdate() {
         DispatchQueue.main.async {

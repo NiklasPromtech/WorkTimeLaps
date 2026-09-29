@@ -1,40 +1,109 @@
 import Foundation
+import Security
 
-/// Persists the Anthropic API key between launches.
+/// Stores the Anthropic API key in the login keychain.
 ///
-/// Currently backed by UserDefaults — the key lives in plaintext in
-/// `~/Library/Preferences/com.niklas.worktimelaps.plist`. That's acceptable
-/// for a local personal utility, but note: anyone with file-system access
-/// to your user account can read it. If you want stronger protection,
-/// swap the implementation to Security.framework (SecItemAdd / SecItemCopy).
+/// Earlier versions kept the key in plaintext UserDefaults; it's moved to
+/// the keychain (and deleted from preferences) the first time it's read.
+///
+/// Because builds are ad-hoc signed, macOS may ask once after each rebuild
+/// whether WorkTimeLaps may read its keychain item — choose "Always Allow".
+@MainActor
 enum APIKeyStore {
-    private static let defaultsKey = "anthropic_api_key"
+
+    private static let service = "WorkTimeLaps"
+    private static let account = "anthropic-api-key"
+    private static let legacyDefaultsKey = "anthropic_api_key"
+
+    /// In-memory copy so the keychain is read once per launch, not every
+    /// time a menu or settings view refreshes.
+    private static var cached: String??
 
     static func load() -> String? {
-        let value = UserDefaults.standard.string(forKey: defaultsKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (value?.isEmpty == false) ? value : nil
+        if let cached { return cached }
+        migrateLegacyKeyIfNeeded()
+        let value = readKeychain()
+        cached = .some(value)
+        return value
     }
 
     static func save(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
+        guard !trimmed.isEmpty else {
             clear()
-        } else {
-            UserDefaults.standard.set(trimmed, forKey: defaultsKey)
+            return
+        }
+        if writeKeychain(trimmed) {
+            cached = .some(trimmed)
+            NotificationCenter.default.post(name: .worktimelapsAPIKeyChanged, object: nil)
         }
     }
 
     static func clear() {
-        UserDefaults.standard.removeObject(forKey: defaultsKey)
+        SecItemDelete(baseQuery as CFDictionary)
+        UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
+        cached = .some(nil)
+        NotificationCenter.default.post(name: .worktimelapsAPIKeyChanged, object: nil)
     }
 
     /// Short fingerprint for the UI — first 4 chars + "…" + last 4 chars.
     /// Never returns the full key.
     static func fingerprint(of key: String) -> String {
         guard key.count > 12 else { return "••••" }
-        let prefix = key.prefix(4)
-        let suffix = key.suffix(4)
-        return "\(prefix)…\(suffix)"
+        return "\(key.prefix(4))…\(key.suffix(4))"
+    }
+
+    // MARK: - Keychain
+
+    private static var baseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+    }
+
+    private static func readKeychain() -> String? {
+        var query = baseQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let key = String(data: data, encoding: .utf8) else {
+            if status != errSecItemNotFound {
+                NSLog("WorkTimeLaps: keychain read failed (\(status))")
+            }
+            return nil
+        }
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    @discardableResult
+    private static func writeKeychain(_ key: String) -> Bool {
+        let data = Data(key.utf8)
+        let update: [String: Any] = [kSecValueData as String: data]
+        var status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = baseQuery
+            add[kSecValueData as String] = data
+            add[kSecAttrLabel as String] = "WorkTimeLaps — Anthropic API key"
+            status = SecItemAdd(add as CFDictionary, nil)
+        }
+        if status != errSecSuccess {
+            NSLog("WorkTimeLaps: keychain write failed (\(status))")
+        }
+        return status == errSecSuccess
+    }
+
+    /// Moves a key saved by an earlier version out of plaintext preferences.
+    private static func migrateLegacyKeyIfNeeded() {
+        guard let legacy = UserDefaults.standard.string(forKey: legacyDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+        if legacy.isEmpty || writeKeychain(legacy) {
+            UserDefaults.standard.removeObject(forKey: legacyDefaultsKey)
+        }
     }
 }

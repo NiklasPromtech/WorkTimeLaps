@@ -17,9 +17,13 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Niklas Andersson. MIT License.</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>LSUIElement</key>
@@ -27,6 +31,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>WorkTimeLaps captures your screen every 10 seconds while recording, and compiles the frames into a time-lapse video when you press Stop.</string>
+    <string>WorkTimeLaps takes a screenshot every 10 seconds while recording to build a time-lapse of your work day and write your daily work diary.</string>
 </dict>
 </plist>

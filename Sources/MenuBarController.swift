@@ -1,132 +1,131 @@
 import Cocoa
-import UserNotifications
 
-/// NSSecureTextField subclass that handles cmd-C / cmd-V / cmd-X / cmd-A
-/// itself. Inside an NSAlert's modal event loop, the main-menu Edit actions
-/// don't route to the accessory view, which is why cmd-V does nothing in a
-/// stock NSSecureTextField-in-alert. Dispatching the action explicitly to
-/// the responder chain fixes that.
-final class PasteableSecureTextField: NSSecureTextField {
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown,
-           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
-            switch event.charactersIgnoringModifiers {
-            case "v":
-                if NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self) { return true }
-            case "c":
-                if NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self) { return true }
-            case "x":
-                if NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self) { return true }
-            case "a":
-                if NSApp.sendAction(#selector(NSResponder.selectAll(_:)), to: nil, from: self) { return true }
-            default:
-                break
-            }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-}
-
+/// Owns the status-bar item, its menu, and the recorder.
+///
+/// Menu:
+///   Recording · 3h 12m today          (status)
+///   Coding — editing the capture loop (what the analyzer sees now)
+///   ─────
+///   Stop Recording / Start Recording
+///   Pause ▸ 15 minutes · 1 hour · Until tomorrow   (or Resume Recording)
+///   ─────
+///   Latest Diary… · Journal… · Highlights…
+///   ─────
+///   Settings… · Quit
 @MainActor
-final class MenuBarController: NSObject {
+final class MenuBarController: NSObject, NSMenuDelegate {
+
+    let recorder = TimeLapseRecorder()
 
     private let statusItem: NSStatusItem
-    private let recorder = TimeLapseRecorder()
 
+    private var statusLine: NSMenuItem!
+    private var detailLine: NSMenuItem!
+    private var permissionItem: NSMenuItem!
     private var startStopItem: NSMenuItem!
-    private var statusItemLabel: NSMenuItem!
-    private var categoryItem: NSMenuItem!
-    private var safetyStatusItem: NSMenuItem!
-    private var apiKeyMenuItem: NSMenuItem!
-    private var autoStartItem: NSMenuItem!
+    private var pauseItem: NSMenuItem!
+    private var resumeItem: NSMenuItem!
 
-    /// True while we are still writing out the MP4 after the user pressed Stop.
-    /// Read by AppDelegate to decide whether to defer terminate.
+    /// True while the MP4 is being finalized after Stop. Read by
+    /// AppDelegate to decide whether to defer termination.
     private(set) var isFinalizing = false
-
-    /// Set when applicationShouldTerminate has returned .terminateLater, so
-    /// we remember to call NSApp.reply(...) once stop() completes.
+    private var isStarting = false
     private var isTerminationPending = false
 
-    // MARK: - Preferences
+    /// Set when an automatic start failed for lack of Screen Recording
+    /// permission; the menu then offers to fix it instead of nagging.
+    private var needsScreenPermission = false
 
-    private static let autoStartKey = "WorkTimeLaps.autoStartOnLaunch"
-
-    static var isAutoStartEnabled: Bool {
-        UserDefaults.standard.bool(forKey: autoStartKey)
-    }
-
-    static func setAutoStartEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: autoStartKey)
-    }
+    private var observers: [NSObjectProtocol] = []
 
     override init() {
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
-        setIcon(recording: false, engagement: nil)
         buildMenu()
-        requestNotificationAuthorizationIfPossible()
-        configureAnalyzerFromStoredKey()
+        configureAnalyzer()
+        JournalStore.shared.recorder = recorder
 
-        // Refresh counters + rev meter each time a frame lands.
         recorder.onFrameAppended = { [weak self] in
-            self?.refreshRecordingStatusLabel()
-            self?.refreshEngagementIcon()
+            self?.refresh()
         }
+        let names: [Notification.Name] = [
+            .worktimelapsRecorderStateChanged,
+            .worktimelapsSystemStateChanged,
+            .worktimelapsAPIKeyChanged
+        ]
+        for name in names {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                let isKeyChange = note.name == .worktimelapsAPIKeyChanged
+                MainActor.assumeIsolated {
+                    if isKeyChange { self?.configureAnalyzer() }
+                    self?.refresh()
+                }
+            })
+        }
+        refresh()
     }
 
     // MARK: - Menu
 
     private func buildMenu() {
         let menu = NSMenu()
-        // We control enabled state ourselves (e.g. disable Start while finalizing).
         menu.autoenablesItems = false
+        menu.delegate = self
 
-        statusItemLabel = NSMenuItem(title: "Idle", action: nil, keyEquivalent: "")
-        statusItemLabel.isEnabled = false
-        menu.addItem(statusItemLabel)
+        statusLine = NSMenuItem(title: "Not recording", action: nil, keyEquivalent: "")
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
 
-        categoryItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        categoryItem.isEnabled = false
-        categoryItem.isHidden = true
-        menu.addItem(categoryItem)
+        detailLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        detailLine.isEnabled = false
+        detailLine.isHidden = true
+        menu.addItem(detailLine)
 
-        safetyStatusItem = NSMenuItem(title: "Safety check: Off (no API key)", action: nil, keyEquivalent: "")
-        safetyStatusItem.isEnabled = false
-        menu.addItem(safetyStatusItem)
+        permissionItem = NSMenuItem(title: "Grant Screen Recording Access…", action: #selector(grantScreenAccess), keyEquivalent: "")
+        permissionItem.target = self
+        permissionItem.isHidden = true
+        menu.addItem(permissionItem)
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(.separator())
 
-        startStopItem = NSMenuItem(title: "Start Time Lapse", action: #selector(toggleRecording), keyEquivalent: "s")
+        startStopItem = NSMenuItem(title: "Start Recording", action: #selector(toggleRecording), keyEquivalent: "s")
         startStopItem.target = self
         menu.addItem(startStopItem)
 
-        menu.addItem(NSMenuItem.separator())
+        let pauseMenu = NSMenu()
+        for (title, minutes) in [("For 15 Minutes", 15), ("For 1 Hour", 60), ("Until Tomorrow", -1)] {
+            let item = NSMenuItem(title: title, action: #selector(pauseSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = minutes
+            pauseMenu.addItem(item)
+        }
+        pauseItem = NSMenuItem(title: "Pause Recording", action: nil, keyEquivalent: "")
+        pauseItem.submenu = pauseMenu
+        menu.addItem(pauseItem)
 
-        apiKeyMenuItem = NSMenuItem(title: "Set Anthropic API Key…", action: #selector(setAPIKey), keyEquivalent: "")
-        apiKeyMenuItem.target = self
-        menu.addItem(apiKeyMenuItem)
+        resumeItem = NSMenuItem(title: "Resume Recording", action: #selector(resume), keyEquivalent: "")
+        resumeItem.target = self
+        menu.addItem(resumeItem)
 
-        autoStartItem = NSMenuItem(title: "Auto-start on launch", action: #selector(toggleAutoStart), keyEquivalent: "")
-        autoStartItem.toolTip = "When enabled, WorkTimeLaps begins recording automatically whenever it launches. Add the app to System Settings → General → Login Items to have it launch at login."
-        autoStartItem.target = self
-        autoStartItem.state = Self.isAutoStartEnabled ? .on : .off
-        menu.addItem(autoStartItem)
+        menu.addItem(.separator())
 
-        let highlightsItem = NSMenuItem(title: "Open Highlights…", action: #selector(openHighlights), keyEquivalent: "h")
-        highlightsItem.target = self
-        highlightsItem.toolTip = "Moments worth remembering — recognition captured from your work."
-        menu.addItem(highlightsItem)
+        let diaryItem = NSMenuItem(title: "Latest Diary…", action: #selector(openDiary), keyEquivalent: "d")
+        diaryItem.target = self
+        menu.addItem(diaryItem)
 
-        let journalItem = NSMenuItem(title: "Open Journal…", action: #selector(openJournal), keyEquivalent: "j")
+        let journalItem = NSMenuItem(title: "Journal…", action: #selector(openJournal), keyEquivalent: "j")
         journalItem.target = self
         menu.addItem(journalItem)
+
+        let highlightsItem = NSMenuItem(title: "Highlights…", action: #selector(openHighlights), keyEquivalent: "h")
+        highlightsItem.target = self
+        menu.addItem(highlightsItem)
+
+        menu.addItem(.separator())
 
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
-
-        menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit WorkTimeLaps", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
@@ -135,59 +134,71 @@ final class MenuBarController: NSObject {
         statusItem.menu = menu
     }
 
-    // MARK: - Analyzer state / status labels
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+    }
 
-    private func configureAnalyzerFromStoredKey() {
+    // MARK: - State
+
+    func configureAnalyzer() {
         if let key = APIKeyStore.load() {
             recorder.configureAnalyzer(FrameAnalyzer(apiKey: key))
         } else {
             recorder.configureAnalyzer(nil)
         }
-        refreshSafetyLabel()
     }
 
-    private func refreshSafetyLabel() {
-        if let key = APIKeyStore.load() {
-            let fp = APIKeyStore.fingerprint(of: key)
-            safetyStatusItem.title = "Safety check: On  (key \(fp))"
-            apiKeyMenuItem.title = "Change Anthropic API Key…"
-        } else {
-            safetyStatusItem.title = "Safety check: Off (no API key)"
-            apiKeyMenuItem.title = "Set Anthropic API Key…"
-        }
-    }
+    /// Brings the icon and every menu line in line with the recorder.
+    func refresh() {
+        let pause = recorder.pauseReason
+        let today = JournalStore.shared.cell(for: JournalStore.currentWorkDay).totalDuration
+        let todayText = today >= 60 ? " · \(DiaryFormat.duration(today)) today" : ""
 
-    private func refreshRecordingStatusLabel() {
-        guard recorder.isRecording else { return }
-        let safe = recorder.safeFrameCount
-        let redacted = recorder.redactedFrameCount
-        if recorder.isSafetyCheckEnabled {
-            statusItemLabel.title = "Recording… (\(safe) safe, \(redacted) redacted)"
+        if isStarting {
+            statusLine.title = "Starting…"
+        } else if isFinalizing {
+            statusLine.title = "Finishing the video…"
+        } else if !recorder.isRecording {
+            statusLine.title = needsScreenPermission ? "Not recording — needs Screen Recording access" : "Not recording\(todayText)"
+        } else if let pause {
+            statusLine.title = pause.label
         } else {
-            let total = safe + redacted
-            statusItemLabel.title = "Recording… (\(total) frames)"
+            statusLine.title = "Recording\(todayText)"
         }
 
-        // Secondary line: current activity + summary, if we have one.
-        if let category = recorder.currentCategory {
-            let suffix = recorder.currentSummary.isEmpty ? "" : " — \(recorder.currentSummary)"
-            categoryItem.title = "\(category.display)\(suffix)"
-            categoryItem.isHidden = false
+        if recorder.isRecording && pause == nil {
+            if !recorder.isAnalyzerEnabled {
+                detailLine.title = "Activity labels off — add an API key in Settings"
+                detailLine.isHidden = false
+            } else if let category = recorder.currentCategory {
+                let summary = recorder.currentSummary
+                detailLine.title = summary.isEmpty ? category.display : "\(category.display) — \(summary)"
+                detailLine.isHidden = false
+            } else {
+                detailLine.isHidden = true
+            }
         } else {
-            categoryItem.isHidden = true
+            detailLine.isHidden = true
         }
+
+        permissionItem.isHidden = !needsScreenPermission || recorder.isRecording
+
+        startStopItem.title = recorder.isRecording ? "Stop Recording" : "Start Recording"
+        startStopItem.isEnabled = !isStarting && !isFinalizing
+
+        let userPaused: Bool = {
+            if case .user = pause { return true }
+            return false
+        }()
+        pauseItem.isHidden = !recorder.isRecording || userPaused
+        resumeItem.isHidden = !userPaused
+
+        updateIcon(pause: pause)
     }
 
-    private func refreshEngagementIcon() {
-        setIcon(recording: recorder.isRecording, engagement: recorder.currentEngagement)
-    }
+    // MARK: - Icon
 
-    // MARK: - Icon (dot + optional rev-meter number)
-
-    /// Tiered color for the engagement tachometer. Ranges chosen to map the
-    /// feel we talked about: grey for idle/warmup, blue for steady, orange
-    /// for deep work, red for peak. Uses semantic system colors so the look
-    /// tracks Light/Dark mode and accessibility contrast.
+    /// Grey / blue / orange / red: idle, steady, deep, peak.
     private func engagementColor(_ value: Int) -> NSColor {
         switch value {
         case ..<40:   return .secondaryLabelColor
@@ -197,117 +208,82 @@ final class MenuBarController: NSObject {
         }
     }
 
-    private func setIcon(recording: Bool, engagement: Int?) {
+    private func updateIcon(pause: TimeLapseRecorder.PauseReason?) {
         guard let button = statusItem.button else { return }
-        let symbolName = recording ? "record.circle.fill" : "record.circle"
-        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "WorkTimeLaps") {
+        let symbol: String
+        if !recorder.isRecording {
+            symbol = "record.circle"
+        } else if pause != nil {
+            symbol = "pause.circle"
+        } else {
+            symbol = "record.circle.fill"
+        }
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "WorkTimeLaps") {
             image.isTemplate = true
             button.image = image
             button.imagePosition = .imageLeading
-        } else {
-            button.image = nil
-            button.title = recording ? "●" : "○"
         }
 
-        if recording, let e = engagement {
-            let padded = String(format: " %d", e)
-            let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small),
-                                                       weight: .semibold)
-            let attrs: [NSAttributedString.Key: Any] = [
+        if recorder.isRecording, pause == nil, let e = recorder.currentEngagement {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .semibold)
+            button.attributedTitle = NSAttributedString(string: String(format: " %d", e), attributes: [
                 .font: font,
                 .foregroundColor: engagementColor(e)
-            ]
-            button.attributedTitle = NSAttributedString(string: padded, attributes: attrs)
+            ])
         } else {
             button.attributedTitle = NSAttributedString(string: "")
         }
     }
 
-    // MARK: - Actions
+    // MARK: - Recording
 
-    @objc private func toggleRecording() {
-        if recorder.isRecording {
-            stopRecording()
-        } else {
-            startRecording()
-        }
+    /// Starts recording at launch when the user has opted in.
+    func startIfConfigured() {
+        guard Preferences.hasCompletedOnboarding,
+              Preferences.autoStartRecording,
+              !recorder.isRecording else { return }
+        startRecording(userInitiated: false)
     }
 
-    /// Called by AppDelegate at launch. If the user turned on "Auto-start
-    /// on launch" and their API key + permission work out, start the
-    /// recorder without them having to open the menu.
-    func autoStartIfConfigured() {
-        // Run the retention sweep first — opportunistic, off-main-actor
-        // wouldn't buy anything meaningful since it's already fast.
-        RetentionSweeper.sweep()
-
-        guard Self.isAutoStartEnabled else { return }
-        guard !recorder.isRecording else { return }
-        startRecording()
-    }
-
-    private func startRecording() {
-        startStopItem.isEnabled = false
-        statusItemLabel.title = "Starting…"
+    func startRecording(userInitiated: Bool) {
+        guard !recorder.isRecording, !isStarting else { return }
+        isStarting = true
+        refresh()
 
         Task { @MainActor in
             do {
                 try await recorder.start()
-                startStopItem.title = "Stop Time Lapse"
-                refreshRecordingStatusLabel()
-                if statusItemLabel.title == "Starting…" {
-                    statusItemLabel.title = recorder.isSafetyCheckEnabled
-                        ? "Recording… (safety check on)"
-                        : "Recording…"
-                }
-                setIcon(recording: true, engagement: nil)
+                needsScreenPermission = false
+            } catch let error as TimeLapseRecorder.RecorderError where error.isPermissionProblem {
+                needsScreenPermission = true
+                if userInitiated { presentPermissionAlert() }
             } catch {
-                statusItemLabel.title = "Idle"
-                presentError(error)
+                if userInitiated { presentError(error) }
+                NSLog("WorkTimeLaps: couldn't start recording: \(error.localizedDescription)")
             }
-            startStopItem.isEnabled = true
+            isStarting = false
+            refresh()
         }
     }
 
     private func stopRecording() {
         isFinalizing = true
-        statusItemLabel.title = "Finalizing video…"
-        startStopItem.isEnabled = false
-        setIcon(recording: false, engagement: nil)
+        refresh()
 
         Task { @MainActor in
-            defer {
-                self.isFinalizing = false
-                self.startStopItem.title = "Start Time Lapse"
-                self.startStopItem.isEnabled = true
-                self.categoryItem.isHidden = true
-                // Run a sweep post-stop so a newly-written MP4 that pushes us
-                // over quota gets pruned against older material promptly.
-                RetentionSweeper.sweep()
-                if self.isTerminationPending {
-                    self.isTerminationPending = false
-                    NSApp.reply(toApplicationShouldTerminate: true)
-                }
-            }
-            let redacted = recorder.redactedFrameCount
-            do {
-                let url = try await recorder.stop()
-                if redacted > 0 {
-                    statusItemLabel.title = "Saved: \(url.lastPathComponent)  (\(redacted) redacted)"
-                } else {
-                    statusItemLabel.title = "Saved: \(url.lastPathComponent)"
-                }
-                notifyFinished(url: url, redacted: redacted)
-            } catch {
-                statusItemLabel.title = "Idle"
-                presentError(error)
+            await recorder.stop()
+            isFinalizing = false
+            refresh()
+            DiaryScheduler.shared.sweepExpiredVideo()
+            if isTerminationPending {
+                isTerminationPending = false
+                NSApp.reply(toApplicationShouldTerminate: true)
             }
         }
     }
 
-    /// Called from AppDelegate when the app is asked to quit. Returns true if
-    /// termination can happen immediately; returns false if we've started an
-    /// async stop and the caller should return .terminateLater.
+    /// Called by AppDelegate when the app is asked to quit. Returns false if
+    /// a stop has started and termination must wait for it.
     func shouldTerminateNow() -> Bool {
         if !recorder.isRecording && !isFinalizing {
             return true
@@ -319,57 +295,36 @@ final class MenuBarController: NSObject {
         return false
     }
 
-    @objc private func setAPIKey() {
-        let alert = NSAlert()
-        alert.messageText = "Anthropic API Key"
-        alert.informativeText = """
-        WorkTimeLaps sends each captured frame to Claude Haiku to check for visible secrets \
-        (API keys, passwords, tokens) and to label what you're working on. Frames that look \
-        risky are replaced with a black REDACTED placeholder before being written to the MP4.
+    // MARK: - Actions
 
-        Paste your Anthropic API key below. It's stored locally in your preferences and \
-        only sent to api.anthropic.com.
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Remove Key")
-
-        let field = PasteableSecureTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        field.placeholderString = "sk-ant-…"
-        if let existing = APIKeyStore.load() {
-            field.stringValue = existing
+    @objc private func toggleRecording() {
+        if recorder.isRecording {
+            stopRecording()
+        } else {
+            startRecording(userInitiated: true)
         }
-        alert.accessoryView = field
-
-        NSApp.activate(ignoringOtherApps: true)
-        alert.window.initialFirstResponder = field
-
-        let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn: // Save
-            let trimmed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                APIKeyStore.clear()
-            } else {
-                APIKeyStore.save(trimmed)
-            }
-        case .alertThirdButtonReturn: // Remove
-            APIKeyStore.clear()
-        default: // Cancel
-            return
-        }
-        configureAnalyzerFromStoredKey()
     }
 
-    @objc private func toggleAutoStart() {
-        let next = !Self.isAutoStartEnabled
-        Self.setAutoStartEnabled(next)
-        autoStartItem.state = next ? .on : .off
+    @objc private func pauseSelected(_ sender: NSMenuItem) {
+        let until: Date
+        if sender.tag < 0 {
+            until = WorkDay.nextBoundary(after: Date())
+        } else {
+            until = Date().addingTimeInterval(TimeInterval(sender.tag * 60))
+        }
+        recorder.pause(until: until)
     }
 
-    @objc private func openSettings() {
-        SettingsWindowController.shared.show()
+    @objc private func resume() {
+        recorder.pause(until: nil)
+    }
+
+    @objc private func grantScreenAccess() {
+        ScreenAccess.request()
+    }
+
+    @objc private func openDiary() {
+        DiaryWindowController.shared.showLatest()
     }
 
     @objc private func openJournal() {
@@ -380,28 +335,27 @@ final class MenuBarController: NSObject {
         HighlightsWindowController.shared.show()
     }
 
+    @objc private func openSettings() {
+        SettingsWindowController.shared.show()
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    // MARK: - Notifications & errors
+    // MARK: - Alerts
 
-    private func requestNotificationAuthorizationIfPossible() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-    }
-
-    private func notifyFinished(url: URL, redacted: Int) {
-        let content = UNMutableNotificationContent()
-        content.title = "Time lapse saved"
-        if redacted > 0 {
-            let noun = redacted == 1 ? "frame" : "frames"
-            content.body = "\(url.lastPathComponent) · \(redacted) \(noun) redacted"
-        } else {
-            content.body = url.lastPathComponent
+    private func presentPermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "WorkTimeLaps needs Screen Recording access"
+        alert.informativeText = "Turn on WorkTimeLaps in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen WorkTimeLaps."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            ScreenAccess.request()
         }
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
 
     private func presentError(_ error: Error) {
@@ -412,5 +366,21 @@ final class MenuBarController: NSObject {
         alert.addButton(withTitle: "OK")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+}
+
+/// Screen Recording permission helpers.
+@MainActor
+enum ScreenAccess {
+
+    static var isGranted: Bool { CGPreflightScreenCaptureAccess() }
+
+    /// Asks macOS for access (it prompts once), then opens the matching
+    /// System Settings pane if access still isn't granted.
+    static func request() {
+        if CGRequestScreenCaptureAccess() { return }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }

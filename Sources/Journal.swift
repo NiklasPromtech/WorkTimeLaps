@@ -1,19 +1,16 @@
 import Foundation
 
-/// Daily rollup of every recording that ended on a given calendar date.
+/// Daily rollup of every recording in one work day (see `WorkDay`).
 ///
-/// Lives at `~/Movies/WorkTimeLaps/_journal/YYYY-MM-DD.json` and is the
-/// thing we *never* prune — MP4s can roll off under the size quota but the
-/// journal stays, so the future reviewer ("you've been working your butt
-/// off for X weeks, well done") always has multi-year context to reason
-/// over even when the source videos are gone.
+/// Lives at `<data folder>/_journal/YYYY-MM-DD.json` and is never pruned —
+/// videos roll off after the retention period, but the journal, session
+/// sidecars, diaries and highlights stay.
 ///
-/// Append-only semantics: each recording's summary is pushed once at stop
-/// time. If the app crashes mid-session, the session sidecar is still
-/// authoritative — the journal simply won't mention that session until the
-/// next clean stop re-summarizes it.
+/// Append-only semantics: each recording's summary is pushed when it ends.
+/// If the app crashes mid-session, `SessionRecovery` closes the session out
+/// on the next launch.
 struct DayLog: Codable, Sendable {
-    let date: String              // "YYYY-MM-DD" in local time
+    let date: String              // work-day key, "YYYY-MM-DD"
     var sessions: [SessionDigest]
 
     struct SessionDigest: Codable, Sendable, Identifiable {
@@ -28,12 +25,20 @@ struct DayLog: Codable, Sendable {
         let topCategory: FrameCategory
         let categoryCounts: [String: Int]
 
-        /// User-authored note attached to this session, added via the Journal
-        /// UI after the recording is done. Optional + added late so older
-        /// on-disk entries stay decodable.
+        /// User-authored note attached to this session in the Journal.
+        /// Optional so older entries stay decodable.
         var notes: String?
 
+        /// Time actually recorded, with absences left out. Optional because
+        /// older entries predate it.
+        var activeSeconds: Double?
+
+        /// Wall-clock span, first frame to last.
         var duration: TimeInterval { endedAt.timeIntervalSince(startedAt) }
+
+        /// Best available measure of time worked: the recorded active time,
+        /// or frames × the default 10 s interval for older entries.
+        var activeDuration: TimeInterval { activeSeconds ?? Double(totalFrames) * 10 }
     }
 }
 
@@ -45,51 +50,45 @@ extension Notification.Name {
 
 enum Journal {
 
-    /// Folder holding the per-day journal files. Always exists after first
-    /// call; pruning code must preserve it.
+    /// Folder holding the per-day journal files, the rolling activity
+    /// vocabulary, recognitions and diaries. Never pruned.
     static var folder: URL {
-        let root = TimeLapseRecorder.recordingsFolder
-        let dir = root.appendingPathComponent("_journal", isDirectory: true)
+        let dir = TimeLapseRecorder.recordingsFolder.appendingPathComponent("_journal", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
-    /// File path for a given date (in local time).
-    static func url(for date: Date) -> URL {
-        folder.appendingPathComponent("\(dateKey(date)).json")
-    }
-
-    /// File path for an already-computed dateKey. Lets callers that already
-    /// have "YYYY-MM-DD" strings (e.g. the week grid) skip the re-formatting.
+    /// File for a work-day key ("YYYY-MM-DD").
     static func url(forKey key: String) -> URL {
         folder.appendingPathComponent("\(key).json")
     }
 
-    /// Public so the UI layer can derive keys the same way we do on write.
+    /// Key for a calendar day as-is. The week grid names each work day by
+    /// the calendar date it starts on, so cells use this.
     static func dateKey(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd"
-        f.timeZone = TimeZone.current
-        return f.string(from: date)
+        WorkDay.key(forDay: date)
     }
 
-    /// Append one finished session's digest to the day it ended on.
-    /// Read-modify-write; if the file doesn't exist yet we create it.
+    /// Append one finished session's digest to the work day it started in.
+    /// Read-modify-write; replaces an existing entry with the same id.
     static func append(session: RecordingSession) {
         guard let endedAt = session.endedAt, let summary = session.summary else { return }
 
-        let url = url(for: endedAt)
+        let key = WorkDay.key(for: session.startedAt)
+        let url = url(forKey: key)
         var log: DayLog
-        if let existing = try? read(url: url) {
+        switch JSONFile.read(DayLog.self, from: url) {
+        case .value(let existing):
             log = existing
-        } else {
-            log = DayLog(date: dateKey(endedAt), sessions: [])
+        case .missing:
+            log = DayLog(date: key, sessions: [])
+        case .unreadable(let error):
+            NSLog("WorkTimeLaps: day log \(key) is unreadable (\(error.localizedDescription))")
+            JSONFile.quarantine(url)
+            log = DayLog(date: key, sessions: [])
         }
 
-        // Preserve an existing note if the user already added one to a
-        // previous copy of this session (e.g. they stopped, noted it, then
-        // we reappended for some reason).
+        // Keep a note the user already attached to this session.
         let existingNote = log.sessions.first(where: { $0.id == session.id })?.notes
 
         let digest = DayLog.SessionDigest(
@@ -103,37 +102,37 @@ enum Journal {
             averageEngagement: summary.averageEngagement,
             topCategory: summary.topCategory,
             categoryCounts: summary.categoryCounts,
-            notes: existingNote
+            notes: existingNote,
+            activeSeconds: summary.activeSeconds
         )
 
-        // Replace existing entry with the same id (idempotent re-appends from
-        // a re-run stop) rather than duplicating.
         if let idx = log.sessions.firstIndex(where: { $0.id == digest.id }) {
             log.sessions[idx] = digest
         } else {
             log.sessions.append(digest)
         }
+        log.sessions.sort { $0.startedAt < $1.startedAt }
 
         do {
-            try write(log: log, to: url)
+            try JSONFile.write(log, to: url)
             postUpdate()
         } catch {
-            NSLog("WorkTimeLaps: failed to append journal for \(dateKey(endedAt)): \(error.localizedDescription)")
+            NSLog("WorkTimeLaps: failed to append journal for \(key): \(error.localizedDescription)")
         }
     }
 
-    // MARK: - Loading (for the Journal UI + future cheerleader)
+    // MARK: - Loading
 
-    /// Returns the day log for a given "YYYY-MM-DD" key, or nil if there's
-    /// no file yet. Missing-file is the common case for days with no
-    /// recordings — callers treat nil as "empty day."
+    /// The day log for a work-day key, or nil if there's none (or it can't
+    /// be read — the common case is simply a day with no recordings).
     static func load(dayKey: String) -> DayLog? {
-        let u = url(forKey: dayKey)
-        return try? read(url: u)
+        if case .value(let log) = JSONFile.read(DayLog.self, from: url(forKey: dayKey)) {
+            return log
+        }
+        return nil
     }
 
-    /// Loads every day log on disk, sorted newest first. Used by the
-    /// cheerleader and by the month-over-month roll-up in the Journal window.
+    /// Every day log on disk, newest first.
     static func loadAllDays() -> [DayLog] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
@@ -141,27 +140,27 @@ enum Journal {
         }
         var logs: [DayLog] = []
         for u in entries where u.pathExtension == "json" {
-            if let log = try? read(url: u) {
+            // Only day files — skip activities.json, recognitions.json, etc.
+            guard WorkDay.isKey(u.deletingPathExtension().lastPathComponent) else { continue }
+            if case .value(let log) = JSONFile.read(DayLog.self, from: u) {
                 logs.append(log)
             }
         }
-        // Sort newest first — lexicographic on the date string is correct
-        // because of the YYYY-MM-DD format.
         logs.sort { $0.date > $1.date }
         return logs
     }
 
-    /// Updates (or clears) the note on a specific session. Idempotent. Posts
-    /// `worktimelapsJournalDidUpdate` so every open Journal view refreshes.
+    /// Updates (or clears) the note on a session. Posts
+    /// `worktimelapsJournalDidUpdate` so open Journal views refresh.
     @discardableResult
     static func setNote(sessionID: String, dayKey: String, note: String?) -> Bool {
         let u = url(forKey: dayKey)
-        guard var log = try? read(url: u) else { return false }
+        guard case .value(var log) = JSONFile.read(DayLog.self, from: u) else { return false }
         guard let idx = log.sessions.firstIndex(where: { $0.id == sessionID }) else { return false }
         let trimmed = note?.trimmingCharacters(in: .whitespacesAndNewlines)
         log.sessions[idx].notes = (trimmed?.isEmpty ?? true) ? nil : trimmed
         do {
-            try write(log: log, to: u)
+            try JSONFile.write(log, to: u)
             postUpdate()
             return true
         } catch {
@@ -170,53 +169,72 @@ enum Journal {
         }
     }
 
-    /// URL of the sidecar JSON (frame-level data) for a given digest. Stored
-    /// alongside the MP4 — `<stem>.mp4` / `<stem>.json`.
+    /// Sidecar JSON (frame-level data) for a digest: `<stem>.json`.
     static func sidecarURL(for digest: DayLog.SessionDigest) -> URL {
         let stem = (digest.video as NSString).deletingPathExtension
         return TimeLapseRecorder.recordingsFolder.appendingPathComponent("\(stem).json")
     }
 
-    /// URL of the preview thumbnail saved on the first captured frame.
+    /// Preview thumbnail saved from the session's first unredacted frame.
     static func thumbURL(for digest: DayLog.SessionDigest) -> URL {
         let stem = (digest.video as NSString).deletingPathExtension
         return TimeLapseRecorder.recordingsFolder.appendingPathComponent("\(stem).thumb.jpg")
     }
 
-    /// URL of the MP4 itself.
+    /// The MP4 itself. May no longer exist once the retention period passes.
     static func videoURL(for digest: DayLog.SessionDigest) -> URL {
         TimeLapseRecorder.recordingsFolder.appendingPathComponent(digest.video)
     }
 
-    // MARK: - Private
-
-    private static let encoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.dateEncodingStrategy = .iso8601
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return e
-    }()
-
-    private static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
-
-    private static func read(url: URL) throws -> DayLog {
-        let data = try Data(contentsOf: url)
-        return try decoder.decode(DayLog.self, from: data)
-    }
-
-    private static func write(log: DayLog, to url: URL) throws {
-        let data = try encoder.encode(log)
-        try data.write(to: url, options: .atomic)
-    }
-
     private static func postUpdate() {
-        // Hop to main so observers (SwiftUI) can republish without warnings.
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .worktimelapsJournalDidUpdate, object: nil)
         }
+    }
+}
+
+/// Closes out sessions that never finished — the app crashed, the Mac lost
+/// power, or it was force-quit — so they still count in the journal and the
+/// diary. Run at launch, before recording starts.
+enum SessionRecovery {
+
+    /// Returns the number of sessions recovered. `activeSessionID` is
+    /// skipped (it's the one being recorded right now).
+    @discardableResult
+    static func recoverUnfinishedSessions(excluding activeSessionID: String? = nil) -> Int {
+        let folder = TimeLapseRecorder.recordingsFolder
+        let fm = FileManager.default
+        guard let contents = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+            return 0
+        }
+
+        var recovered = 0
+        for url in contents where url.pathExtension == "json" && url.lastPathComponent.hasPrefix("TimeLapse_") {
+            guard var session = try? SessionWriter.read(from: url),
+                  session.endedAt == nil,
+                  session.id != activeSessionID else { continue }
+
+            guard let last = session.frames.last else {
+                // Nothing was ever recorded: drop the empty shell.
+                try? fm.removeItem(at: url)
+                let video = folder.appendingPathComponent(session.video)
+                if let size = (try? video.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size < 64 * 1024 {
+                    try? fm.removeItem(at: video)
+                }
+                continue
+            }
+
+            session.endedAt = last.t.addingTimeInterval(session.captureIntervalSec)
+            session.summary = SessionSummary.make(frames: session.frames, captureInterval: session.captureIntervalSec)
+            do {
+                try SessionWriter.write(session, to: url)
+                Journal.append(session: session)
+                recovered += 1
+                NSLog("WorkTimeLaps: recovered unfinished session \(session.id) (\(session.frames.count) frames)")
+            } catch {
+                NSLog("WorkTimeLaps: couldn't recover \(session.id): \(error.localizedDescription)")
+            }
+        }
+        return recovered
     }
 }

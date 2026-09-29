@@ -8,10 +8,10 @@ import Foundation
 /// still records the category and (sanitized) summary, so the activity
 /// log stays complete even though the video doesn't.
 ///
-/// Default on first launch: every selectable tag enabled. Niklas's
-/// framing is "err on the side of redact; the log describes what I did
-/// without leaking specifics," and the analyzer prompt is written to
-/// match (generic summaries whenever privacy != none).
+/// Default on first launch: every selectable tag enabled. The principle is
+/// "err on the side of redacting; the log describes what I did without
+/// leaking specifics," and the analyzer prompt is written to match
+/// (generic summaries whenever privacy != none).
 enum PrivacyFilterStore {
 
     private static let defaultsKey = "WorkTimeLaps.privacyFilters.enabledTags"

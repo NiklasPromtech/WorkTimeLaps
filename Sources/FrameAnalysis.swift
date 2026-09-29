@@ -17,6 +17,13 @@ enum FrameCategory: String, Sendable, Codable, CaseIterable {
     case media
     case other
 
+    /// Unknown values (a newer build's category, a hand edit) decode as
+    /// `.other` instead of failing the whole file.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = FrameCategory(rawValue: raw.lowercased()) ?? .other
+    }
+
     /// Display-friendly capitalization for menu labels.
     var display: String {
         rawValue.prefix(1).uppercased() + rawValue.dropFirst()
@@ -52,6 +59,11 @@ enum PrivacyTag: String, Sendable, Codable, CaseIterable {
     case personal_messages  // DMs with friends/family; NOT work chat
     case medical            // patient records, therapy notes, lab results, prescriptions
     case hr_legal           // compensation, performance reviews, hiring pipelines, contracts
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = PrivacyTag(rawValue: raw.lowercased()) ?? .none
+    }
 
     /// Short label for the settings UI.
     var display: String {
@@ -103,7 +115,7 @@ enum PrivacyTag: String, Sendable, Codable, CaseIterable {
 /// - `recognition*` — if the frame shows a real person praising the user
 ///   for a specific contribution, the analyzer extracts the quote and
 ///   the speaker's name. Powers the Highlights / brag-sheet feature
-///   (Phase 11) — see Recognition.swift.
+///   — see Recognition.swift.
 ///
 /// Safety and privacy are *always* re-evaluated, never inherited via
 /// `sameAsBefore` — a transient credential flash needs to be caught even

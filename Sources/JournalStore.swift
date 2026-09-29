@@ -4,9 +4,8 @@ import SwiftUI
 /// Central read path for everything journal-related. Owns a cached list of
 /// day logs loaded from `_journal/*.json`, observes the recorder for live
 /// updates, and exposes derivations (week grid cells, day detail) used by
-/// both the Journal window and — eventually — the cheerleader reviewer in
-/// Phase 9. Keeping this in one place means we add features or migrate the
-/// schema once rather than in two places.
+/// the Journal window, the Diary and the menu bar. Days are work days (see
+/// `WorkDay`), named by the calendar date they start on.
 @MainActor
 final class JournalStore: ObservableObject {
 
@@ -14,6 +13,10 @@ final class JournalStore: ObservableObject {
 
     /// Loaded day logs, newest first.
     @Published private(set) var days: [DayLog] = []
+
+    /// Navigation stack of the Journal window (day keys, then sessions).
+    /// Lets other windows open the Journal on a specific day.
+    @Published var path = NavigationPath()
 
     /// Weak reference to the live recorder, set by MenuBarController when
     /// the Journal window is opened. Allows the store to surface the
@@ -66,20 +69,27 @@ final class JournalStore: ObservableObject {
     /// today, which can additionally carry a live snapshot of a
     /// currently-running recording.
     struct DayCell: Identifiable {
-        let id: String           // dateKey, e.g. "2026-04-24"
+        let id: String           // work-day key, e.g. "2026-04-24"
         let date: Date           // local noon of the day — for sorting/format
         let dateKey: String
-        let isToday: Bool
+        let isToday: Bool        // the work day in progress
         let sessions: [DayLog.SessionDigest]
         let live: LiveSessionSnapshot?
 
-        /// Completed-session time plus the live session's elapsed time, if any.
+        /// Time worked: completed sessions' active time plus the live
+        /// session's, with absences (locked screen, sleep, pauses) left out.
         var totalDuration: TimeInterval {
-            let completed = sessions.reduce(0.0) { $0 + $1.duration }
-            if let live = live {
-                return completed + Date().timeIntervalSince(live.startedAt)
-            }
-            return completed
+            sessions.reduce(0.0) { $0 + $1.activeDuration } + (live?.activeSeconds ?? 0)
+        }
+
+        /// First and last moment anything was recorded.
+        var firstActivity: Date? {
+            let starts = sessions.map(\.startedAt) + (live.map { [$0.startedAt] } ?? [])
+            return starts.min()
+        }
+        var lastActivity: Date? {
+            let ends = sessions.map(\.endedAt) + (live.map { [$0.lastUpdated] } ?? [])
+            return ends.max()
         }
 
         var totalFrames: Int {
@@ -116,8 +126,8 @@ final class JournalStore: ObservableObject {
     }
 
     /// Builds the 7-cell strip for a given week. `anchor` can be any day
-    /// inside the week you want displayed; we snap to Monday as the first
-    /// column (standard for work-week thinking).
+    /// inside the week you want displayed; the first column follows the
+    /// user's calendar settings.
     func weekCells(containing anchor: Date) -> [DayCell] {
         let cal = Calendar.current
         var components = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: anchor)
@@ -135,13 +145,13 @@ final class JournalStore: ObservableObject {
     func cell(for date: Date) -> DayCell {
         let key = Journal.dateKey(date)
         let log = days.first(where: { $0.date == key })
-        let todayKey = Journal.dateKey(Date())
+        let todayKey = WorkDay.key(for: Date())
         let isToday = key == todayKey
 
         let live: LiveSessionSnapshot? = {
-            guard isToday, let r = recorder, let snap = r.liveSnapshot else { return nil }
-            // Only include the live session if it actually started today.
-            return Journal.dateKey(snap.startedAt) == todayKey ? snap : nil
+            guard let r = recorder, let snap = r.liveSnapshot else { return nil }
+            // The live session belongs to the work day it started in.
+            return WorkDay.key(for: snap.startedAt) == key ? snap : nil
         }()
 
         let noonOfDay = Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: date) ?? date
@@ -164,6 +174,9 @@ final class JournalStore: ObservableObject {
     func loadFullSession(for digest: DayLog.SessionDigest) -> RecordingSession? {
         try? SessionWriter.read(from: Journal.sidecarURL(for: digest))
     }
+
+    /// The work day in progress, as a calendar date (for the week anchor).
+    static var currentWorkDay: Date { WorkDay.day(containing: Date()) }
 
     // MARK: - Note editing
 

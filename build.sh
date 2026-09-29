@@ -1,6 +1,10 @@
 #!/bin/bash
 # Build WorkTimeLaps.app from source without needing an Xcode project.
 # Requires: Xcode Command Line Tools (`xcode-select --install`).
+#
+#   ./build.sh           build WorkTimeLaps.app in this folder
+#   ./build.sh install   …and copy it to /Applications (recommended, so the
+#                        login item keeps pointing at the right place)
 
 set -euo pipefail
 
@@ -21,9 +25,11 @@ echo "▶ Creating bundle structure…"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 echo "▶ Compiling Swift sources…"
-# -O   = optimize
-# No explicit -target; swiftc defaults to the host architecture.
+# -O       optimize
+# -target  host architecture, macOS 14 deployment target (matches
+#          LSMinimumSystemVersion, and makes the compiler reject newer APIs)
 swiftc -O \
+    -target "$(uname -m)-apple-macos14.0" \
     -o "$MACOS_DIR/$APP_NAME" \
     -framework Cocoa \
     -framework SwiftUI \
@@ -33,11 +39,14 @@ swiftc -O \
     -framework CoreGraphics \
     -framework CoreVideo \
     -framework ScreenCaptureKit \
+    -framework Security \
+    -framework ServiceManagement \
     -framework UserNotifications \
     Sources/*.swift
 
-echo "▶ Copying Info.plist…"
+echo "▶ Copying Info.plist and icon…"
 cp Resources/Info.plist "$CONTENTS_DIR/Info.plist"
+cp Resources/AppIcon.icns "$RESOURCES_DIR/AppIcon.icns"
 
 echo "▶ Writing PkgInfo…"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
@@ -50,9 +59,24 @@ codesign --force --sign - "$BUNDLE_DIR"
 
 echo ""
 echo "✅ Built $BUNDLE_DIR"
+
+if [ "${1:-}" = "install" ]; then
+    echo "▶ Installing to /Applications…"
+    # Quit a running copy first (lets it finish the current video cleanly).
+    if pgrep -x "$APP_NAME" >/dev/null; then
+        osascript -e 'tell application id "com.niklas.worktimelaps" to quit' >/dev/null 2>&1 || true
+        while pgrep -x "$APP_NAME" >/dev/null; do sleep 0.5; done
+    fi
+    rm -rf "/Applications/$BUNDLE_DIR"
+    ditto "$BUNDLE_DIR" "/Applications/$BUNDLE_DIR"
+    echo "✅ Installed /Applications/$BUNDLE_DIR"
+    APP_PATH="/Applications/$BUNDLE_DIR"
+else
+    APP_PATH="$BUNDLE_DIR"
+fi
+
 echo ""
 echo "Next steps:"
-echo "  1. Open it:          open $BUNDLE_DIR"
-echo "  2. Grant permission: System Settings → Privacy & Security → Screen Recording"
-echo "     (toggle WorkTimeLaps on, then relaunch the app)"
-echo "  3. Look at the top-right menu bar for a ○ icon."
+echo "  1. Open it:          open \"$APP_PATH\""
+echo "  2. Follow the welcome window: API key, Screen Recording access, login item."
+echo "  3. Look for the ◉ icon in the menu bar."

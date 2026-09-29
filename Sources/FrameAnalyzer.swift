@@ -13,9 +13,8 @@ import UniformTypeIdentifiers
 ///
 /// Fail-closed by contract: if the network fails, the JSON is malformed, or
 /// any required field is missing, we return `.failed(reason)` and
-/// TimeLapseRecorder treats the frame as unsafe (redacts it). Same principle
-/// as the old SafetyChecker: a flaky network must never silently disable the
-/// protection.
+/// TimeLapseRecorder treats the frame as unsafe (redacts it): a flaky network
+/// must never silently disable the protection.
 struct FrameAnalyzer: Sendable {
 
     enum Outcome: Sendable {
@@ -161,6 +160,12 @@ struct FrameAnalyzer: Sendable {
             return "User identity: the person using this Mac is \"\(name)\". When evaluating recognition, this is the only person whose praise should ever count — never log praise addressed to anyone else."
         }()
 
+        // First name for the "addressed by name" examples below.
+        let firstName = userName?
+            .split(separator: " ")
+            .first
+            .map(String.init) ?? "the user"
+
         return """
         You are analyzing a screen-recording frame for a local macOS tool. \
         Output JSON and nothing else — no prose, no markdown fences.
@@ -277,7 +282,7 @@ struct FrameAnalyzer: Sendable {
           - A 1-on-1 DM where the message header shows the user's name \
         as the recipient.
           - A thread reply that explicitly addresses the user by name \
-        ("@\(userName ?? "the user")", "Niklas, …", or the recipient \
+        ("@\(firstName)", "\(firstName), …", or the recipient \
         line of an email shows the user).
           - A comment on a document/PR/issue that the user authored, \
         replying to their work.
@@ -371,7 +376,7 @@ struct FrameAnalyzer: Sendable {
         let privacyRaw = (obj["privacy"] as? String)?.lowercased() ?? "none"
         let privacy = PrivacyTag(rawValue: privacyRaw) ?? .none
 
-        // New fields (Phase 9). Both default to safe values when missing
+        // Activity fields. Both default to safe values when missing
         // so partial responses still produce a usable FrameAnalysis — the
         // recorder validates `activity` separately and falls back to the
         // category display name if the model's first attempt is too generic.
@@ -379,7 +384,7 @@ struct FrameAnalyzer: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sameAsBefore = (obj["sameAsBefore"] as? Bool) ?? false
 
-        // Recognition fields (Phase 11). Default to .none / empty so
+        // Recognition fields. Default to .none / empty so
         // partial / older responses just don't contribute to the brag
         // sheet — they don't break the analyzer pipeline.
         let recognitionRaw = (obj["recognitionLevel"] as? String)?.lowercased() ?? "none"

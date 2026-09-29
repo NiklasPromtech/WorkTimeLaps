@@ -16,8 +16,8 @@ struct ActivityEntry: Codable, Sendable, Equatable {
 }
 
 /// Rolling 2-hour vocabulary of activities the analyzer has emitted. Stored
-/// at `~/Movies/WorkTimeLaps/_journal/activities.json` so it survives
-/// quota-driven MP4 pruning. Entries older than `windowDuration` are
+/// at `<data folder>/_journal/activities.json`, which video retention
+/// never touches. Entries older than `windowDuration` are
 /// filtered out of the prompt and pruned from disk on each write.
 ///
 /// Why time-windowed instead of all-time:

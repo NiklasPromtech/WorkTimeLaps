@@ -371,8 +371,19 @@ private struct ScrubBar: View {
 /// Tuned for the light appearance the Journal pins itself to. Colors are
 /// pale and saturated only enough to show through the cards as faint
 /// tints — not to dominate the view.
+///
+/// The blobs live in an overlay on a flexible clear view, so their fixed
+/// sizes never widen the layout of a window narrower than they are.
 struct BackgroundCanvas: View {
     var body: some View {
+        Color.clear.overlay {
+            blobs
+        }
+        .clipped()
+        .ignoresSafeArea()
+    }
+
+    private var blobs: some View {
         ZStack {
             // Base gradient — slightly stronger pastel diagonal than the
             // first pass so the cards on top, even with ultraThinMaterial,
@@ -412,7 +423,6 @@ struct BackgroundCanvas: View {
                 .opacity(0.40)
                 .offset(x: 90, y: -380)
         }
-        .ignoresSafeArea()
     }
 }
 
@@ -695,20 +705,36 @@ private struct GlassSegmentedToggle<Option: Hashable>: View {
 
 // MARK: - Root view
 
+/// Navigation value for a session inside a day.
+struct SessionRoute: Hashable {
+    let dayKey: String
+    let sessionID: String
+}
+
 struct JournalRootView: View {
     @ObservedObject var store: JournalStore
-    @State private var weekAnchor: Date = Date()
+    @State private var weekAnchor: Date = JournalStore.currentWorkDay
 
     var body: some View {
         ZStack {
             BackgroundCanvas()
 
-            NavigationStack {
+            NavigationStack(path: $store.path) {
                 WeekGridView(store: store, weekAnchor: $weekAnchor)
                     .scrollContentBackground(.hidden)
                     .navigationDestination(for: String.self) { dayKey in
                         DayDetailView(store: store, dayKey: dayKey)
                             .scrollContentBackground(.hidden)
+                    }
+                    .navigationDestination(for: SessionRoute.self) { route in
+                        if let digest = store.days
+                            .first(where: { $0.date == route.dayKey })?
+                            .sessions.first(where: { $0.id == route.sessionID }) {
+                            SessionDetailView(store: store, dayKey: route.dayKey, digest: digest)
+                        } else {
+                            Text("This session is no longer in the journal.")
+                                .foregroundStyle(.secondary)
+                        }
                     }
             }
         }
@@ -771,7 +797,7 @@ struct WeekGridView: View {
                     Image(systemName: "chevron.left")
                 }
                 Button("This week") {
-                    weekAnchor = Date()
+                    weekAnchor = JournalStore.currentWorkDay
                 }
                 Button {
                     shiftWeek(by: 1)
@@ -785,7 +811,7 @@ struct WeekGridView: View {
     }
 
     private var isCurrentWeek: Bool {
-        Calendar.current.isDate(weekAnchor, equalTo: Date(), toGranularity: .weekOfYear)
+        Calendar.current.isDate(weekAnchor, equalTo: JournalStore.currentWorkDay, toGranularity: .weekOfYear)
     }
 
     private func shiftWeek(by delta: Int) {
@@ -808,6 +834,11 @@ struct DayCellView: View {
                 Spacer()
                 if cell.live != nil {
                     LiveDot()
+                } else if DiaryStore.exists(dayKey: cell.dateKey) {
+                    Image(systemName: "book.closed.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.accentColor)
+                        .help("A diary entry exists for this day")
                 }
             }
 
@@ -914,7 +945,7 @@ struct DayDetailView: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 24) {
-            stat("Recorded", JournalFormat.duration(cell.totalDuration))
+            stat("Worked", JournalFormat.duration(cell.totalDuration))
             stat("Sessions", "\(cell.sessions.count + (cell.live != nil ? 1 : 0))")
             stat("Frames", "\(cell.totalFrames)")
             if cell.redactedFrames > 0 {
@@ -924,6 +955,14 @@ struct DayDetailView: View {
                 stat("Avg engagement", "\(cell.averageEngagement)")
             }
             Spacer()
+            if cell.hasAnyContent {
+                Button {
+                    DiaryWindowController.shared.show(dayKey: dayKey)
+                } label: {
+                    Label(DiaryStore.exists(dayKey: dayKey) ? "Open diary" : "Diary", systemImage: "book.closed")
+                }
+                .controlSize(.large)
+            }
         }
     }
 
@@ -945,9 +984,7 @@ struct DayDetailView: View {
                     .font(.headline)
 
                 ForEach(cell.sessions) { digest in
-                    NavigationLink {
-                        SessionDetailView(store: store, dayKey: dayKey, digest: digest)
-                    } label: {
+                    NavigationLink(value: SessionRoute(dayKey: dayKey, sessionID: digest.id)) {
                         SessionRowView(digest: digest)
                     }
                     .buttonStyle(.plain)
@@ -975,10 +1012,8 @@ private struct DayTimelineChart: View {
     let cell: JournalStore.DayCell
 
     private var dayBounds: (start: Date, end: Date) {
-        let cal = Calendar.current
-        let start = cal.startOfDay(for: cell.date)
-        let end = cal.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
-        return (start, end)
+        let interval = WorkDay.interval(forDay: cell.date)
+        return (interval.start, interval.end)
     }
 
     var body: some View {
@@ -1037,7 +1072,7 @@ struct SessionRowView: View {
                         .foregroundStyle(.secondary)
                     Text("·")
                         .foregroundStyle(.secondary)
-                    Text(JournalFormat.duration(digest.duration))
+                    Text(JournalFormat.duration(digest.activeDuration))
                         .foregroundStyle(.secondary)
                 }
                 HStack(spacing: 12) {
@@ -1175,7 +1210,7 @@ private final class ActivityRevealQueue: ObservableObject {
 /// (no MP4, no cursor) just collapse to All-equivalent.
 private struct ActivityStreamPanel: View {
 
-    let blocks: [SessionDetailView.ActivityBlock]
+    let blocks: [ActivityBlock]
     let cursorTime: Date?
     let hasInteractivePlayback: Bool
 
@@ -1196,7 +1231,7 @@ private struct ActivityStreamPanel: View {
 
     /// Blocks that have already started by the cursor. When playback is
     /// non-interactive (file pruned, no sidecar) we just show all blocks.
-    private var visible: [SessionDetailView.ActivityBlock] {
+    private var visible: [ActivityBlock] {
         guard hasInteractivePlayback else { return blocks }
         guard let t = cursorTime else { return [] }
         return blocks.filter { $0.start <= t }
@@ -1331,7 +1366,7 @@ private struct ActivityStreamPanel: View {
 /// right. Background is a faint category-tinted glass surface — enough
 /// to identify the category at a glance without overwhelming the row.
 private struct ActivityBlockRow: View {
-    let block: SessionDetailView.ActivityBlock
+    let block: ActivityBlock
 
     var body: some View {
         let tint = CategoryPalette.color(block.topCategory)
@@ -1372,7 +1407,7 @@ private struct ActivityBlockRow: View {
         HStack(spacing: 10) {
             Text("\(JournalFormat.time(block.start)) – \(JournalFormat.time(block.end))")
             Text("·")
-            Text(JournalFormat.duration(block.duration))
+            Text(JournalFormat.duration(block.activeSeconds))
             Text("·")
             HStack(spacing: 3) {
                 Image(systemName: "gauge.medium")
@@ -1425,7 +1460,7 @@ private struct LiveSessionRowView: View {
                         .foregroundStyle(.secondary)
                     Text("·")
                         .foregroundStyle(.secondary)
-                    Text(JournalFormat.duration(Date().timeIntervalSince(live.startedAt)))
+                    Text(JournalFormat.duration(live.activeSeconds))
                         .foregroundStyle(.secondary)
                 }
                 HStack(spacing: 12) {
@@ -1483,7 +1518,7 @@ struct SessionDetailView: View {
 
     /// True when we have frame-level data and a working player to drive
     /// the cursor. Drives whether the bars animate or just show static
-    /// totals (e.g. when the MP4 has been pruned by the storage cap).
+    /// totals (e.g. once the video has passed the retention period).
     private var hasInteractivePlayback: Bool {
         full?.frames.isEmpty == false && player != nil
     }
@@ -1575,8 +1610,7 @@ struct SessionDetailView: View {
     /// up the active block, etc.).
     private var clusteredBlocks: [ActivityBlock] {
         guard let frames = full?.frames, !frames.isEmpty else { return [] }
-        let interval = full?.captureIntervalSec ?? 10
-        return clusterActivityBlocks(frames, captureInterval: interval)
+        return ActivityTimeline.blocks(from: frames, captureInterval: full?.captureIntervalSec ?? 10)
     }
 
     /// Cursor's wall-clock time, derived from cursorCount. Nil when no
@@ -1607,7 +1641,7 @@ struct SessionDetailView: View {
                     Text(digest.topCategory.display)
                         .font(.system(.title2, design: .rounded).weight(.semibold))
                     Text("·").foregroundStyle(.secondary)
-                    Text(JournalFormat.duration(digest.duration))
+                    Text(JournalFormat.duration(digest.activeDuration))
                         .font(.system(.title3, design: .rounded))
                         .foregroundStyle(.secondary)
                 }
@@ -1667,91 +1701,14 @@ struct SessionDetailView: View {
                         Image(systemName: "film.stack")
                             .font(.largeTitle)
                             .foregroundStyle(.secondary)
-                        Text("Video file not found — it may have been pruned by the storage cap.")
+                        Text("Video deleted — WorkTimeLaps keeps video for \(RetentionSweeper.currentLabel.lowercased()).")
                             .foregroundStyle(.secondary)
+                        Text("The activity log, charts and notes are kept.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
                     }
                 )
         }
-    }
-
-    // MARK: Activity stream
-
-    /// One run of consecutive frames sharing the same activity label.
-    /// Computed lazily from the loaded sidecar; fed into the chat-bubble
-    /// stream that fills up as playback advances.
-    struct ActivityBlock: Identifiable {
-        let id: Int64
-        let activity: String
-        let representativeSummary: String
-        let start: Date
-        let end: Date
-        let frameCount: Int
-        let redactedCount: Int
-        let meanEngagement: Int
-        let topCategory: FrameCategory
-        var duration: TimeInterval { max(end.timeIntervalSince(start), 0) }
-    }
-
-    /// Clusters consecutive frames with the same `activity` (case-insensitive,
-    /// nil-safe) into blocks. A nil/empty activity falls back to the
-    /// category's display name so older sidecars (pre-Phase 9) still render
-    /// usefully — they just produce one block per category run instead of
-    /// the more granular tool-level grouping.
-    private func clusterActivityBlocks(_ frames: [FrameEntry], captureInterval: TimeInterval) -> [ActivityBlock] {
-        guard !frames.isEmpty else { return [] }
-
-        func name(_ f: FrameEntry) -> String {
-            let raw = (f.activity ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            return raw.isEmpty ? f.category.display : raw
-        }
-        func key(_ f: FrameEntry) -> String { name(f).lowercased() }
-
-        var blocks: [ActivityBlock] = []
-        var startIdx = 0
-        for i in 1...frames.count {
-            let endHere = (i == frames.count) || key(frames[i]) != key(frames[startIdx])
-            guard endHere else { continue }
-
-            let slice = Array(frames[startIdx..<i])
-            let first = slice.first!
-            let last = slice.last!
-
-            // Most-common summary across the slice; falls back to the
-            // first frame's summary if every frame's text is unique.
-            var summaryCounts: [String: Int] = [:]
-            for f in slice where !f.summary.isEmpty {
-                summaryCounts[f.summary, default: 0] += 1
-            }
-            let representative = summaryCounts.max(by: { $0.value < $1.value })?.key
-                ?? first.summary
-
-            // Top category in the slice.
-            var catCounts: [FrameCategory: Int] = [:]
-            for f in slice { catCounts[f.category, default: 0] += 1 }
-            let top = catCounts.max(by: { $0.value < $1.value })?.key ?? .other
-
-            let totalEng = slice.reduce(0) { $0 + $1.engagementSmoothed }
-            let mean = slice.isEmpty ? 0 : totalEng / slice.count
-            let redacted = slice.filter { $0.redacted }.count
-
-            // End of block = last frame's timestamp + one capture interval,
-            // so a single-frame block still has a non-zero visible duration.
-            let end = last.t.addingTimeInterval(captureInterval)
-
-            blocks.append(ActivityBlock(
-                id: first.i,
-                activity: name(first),
-                representativeSummary: representative,
-                start: first.t,
-                end: end,
-                frameCount: slice.count,
-                redactedCount: redacted,
-                meanEngagement: mean,
-                topCategory: top
-            ))
-            startIdx = i
-        }
-        return blocks
     }
 
     // MARK: Engagement chart
@@ -2090,9 +2047,12 @@ final class JournalWindowController {
 
     /// Hand in the currently-active recorder so the store can render the
     /// live session. Safe to call multiple times; the store holds it weakly.
-    func show(recorder: TimeLapseRecorder?) {
+    func show(recorder: TimeLapseRecorder?, dayKey: String? = nil) {
         JournalStore.shared.recorder = recorder
         JournalStore.shared.reload()
+        if let dayKey {
+            JournalStore.shared.path = NavigationPath([dayKey])
+        }
 
         if let existing = window {
             NSApp.activate(ignoringOtherApps: true)
@@ -2102,7 +2062,7 @@ final class JournalWindowController {
 
         let hosting = NSHostingController(rootView: JournalRootView(store: JournalStore.shared))
         let window = NSWindow(contentViewController: hosting)
-        window.title = "WorkTimeLaps Journal"
+        window.title = "Journal"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.setContentSize(NSSize(width: 1320, height: 820))
         window.center()

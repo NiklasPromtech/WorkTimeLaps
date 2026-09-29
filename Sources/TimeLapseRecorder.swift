@@ -11,18 +11,15 @@ extension Notification.Name {
     /// UI uses this to refresh the live "today" cell and live session row.
     static let worktimelapsFrameAppended = Notification.Name("WorkTimeLaps.frameAppended")
 
-    /// Posted (on main) after a recording is stopped and the journal entry
-    /// has been written. Paired with `worktimelapsJournalDidUpdate` — this
-    /// one is strictly about sessions ending, useful when the UI wants to
-    /// react specifically to "a recording just finished" rather than any
-    /// note-edit journal write.
+    /// Posted (on main) after a session ends and its journal entry has been
+    /// written — on Stop, at the work-day rollover, and on quit.
     static let worktimelapsSessionCompleted = Notification.Name("WorkTimeLaps.sessionCompleted")
+
+    /// Posted (on main) when recording starts, stops, pauses or resumes.
+    static let worktimelapsRecorderStateChanged = Notification.Name("WorkTimeLaps.recorderStateChanged")
 }
 
-/// Read-only view of the in-progress recording, safe to hand to UI code that
-/// doesn't want to poke at the recorder internals. Rebuilt on demand; the
-/// Journal store calls `liveSnapshot` whenever a frame-appended notification
-/// fires.
+/// Read-only view of the in-progress session, safe to hand to UI code.
 struct LiveSessionSnapshot: Sendable {
     let id: String
     let video: String
@@ -32,28 +29,32 @@ struct LiveSessionSnapshot: Sendable {
     let redactedFrames: Int
     let engagement: Int?
     let topCategory: FrameCategory?
+    let activeSeconds: TimeInterval
     var totalFrames: Int { safeFrames + redactedFrames }
 }
 
-/// Captures a screenshot of the main display every `captureInterval` seconds
-/// using ScreenCaptureKit, asks Claude Haiku what's on screen, and streams
-/// each frame (or a redacted placeholder if secrets are visible) straight
-/// into an MP4 on disk via AVAssetWriter. A companion sidecar JSON is
-/// rewritten after every frame so a crash still leaves a readable session.
+/// Captures a screenshot of the main display every `captureInterval`
+/// seconds using ScreenCaptureKit, asks Claude Haiku what's on screen, and
+/// streams each frame (or a REDACTED placeholder) into an MP4 via
+/// AVAssetWriter. A sidecar JSON next to the video holds the frame log.
 ///
-/// Streaming (rather than buffering CGImages in memory) means a multi-hour
-/// session uses roughly constant memory regardless of recording length.
+/// Recording is meant to stay on all day:
+/// - Capture pauses while the screen is locked, the display or Mac is
+///   asleep, or the user paused it — no screenshots, no API calls.
+/// - A session is opened lazily on its first frame and closed at the
+///   work-day cutoff (02:00 by default), so each session belongs to exactly
+///   one work day and the next one starts on its own.
+/// - Frames from blocked apps/windows and from WorkTimeLaps itself are never
+///   sent to the API.
 ///
-/// The whole class is @MainActor, so there is no explicit locking —
-/// serialization comes from the main actor itself. Captures hop off main
-/// during their `await` (SCK and the analyzer do the heavy work off-main)
-/// and only touch writer/session state back on main.
+/// The class is @MainActor, so there is no explicit locking. Captures hop
+/// off main during their `await`s and only touch writer/session state back
+/// on main.
 @MainActor
 final class TimeLapseRecorder {
 
     enum RecorderError: LocalizedError {
         case alreadyRecording
-        case notRecording
         case screenUnavailable(underlying: String?)
         case writerFailed(String)
 
@@ -61,19 +62,40 @@ final class TimeLapseRecorder {
             switch self {
             case .alreadyRecording:
                 return "A recording is already in progress."
-            case .notRecording:
-                return "No recording is in progress."
             case .screenUnavailable(let underlying):
-                let base = "Couldn't capture the screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen Recording, then relaunch WorkTimeLaps."
+                let base = "Couldn't capture the screen. Grant Screen Recording permission in System Settings → Privacy & Security → Screen & System Audio Recording, then relaunch WorkTimeLaps."
                 if let u = underlying { return "\(base)\n\n(\(u))" }
                 return base
             case .writerFailed(let msg):
                 return "Couldn't write the video file: \(msg)"
             }
         }
+
+        /// True when the fix is granting Screen Recording permission.
+        var isPermissionProblem: Bool {
+            if case .screenUnavailable = self { return true }
+            return false
+        }
     }
 
-    // MARK: - Public config
+    /// Why nothing is being captured while recording is on.
+    enum PauseReason: Equatable {
+        case user(until: Date)
+        case away(String)
+
+        var label: String {
+            switch self {
+            case .user(let until):
+                let f = DateFormatter()
+                f.timeStyle = .short
+                return "Paused until \(f.string(from: until))"
+            case .away(let why):
+                return "Paused — \(why)"
+            }
+        }
+    }
+
+    // MARK: - Config
 
     /// Time between screenshots, in real seconds.
     let captureInterval: TimeInterval = 10.0
@@ -83,54 +105,60 @@ final class TimeLapseRecorder {
     let playbackFPS: Int32 = 10
 
     /// H.264 target bitrate. Screen content compresses very well, so 3 Mbps
-    /// is plenty at 10 fps for a 1440p desktop shot — produces ~20 MB per
-    /// recorded hour. Raising it mostly just wastes disk.
+    /// is plenty at 10 fps.
     let videoBitrate: Int = 3_000_000
 
-    /// Gap multiplier that counts as a sleep/lid-close. If >3× captureInterval
-    /// passed since the previous frame we treat this one as "waking up":
-    /// engagement forced to 0 and the gap is flagged in the sidecar.
-    private let sleepGapMultiplier: Double = 3.0
-
     /// EMA smoothing factor for the engagement "rev meter". α=0.1 gives a
-    /// ~20-sample effective window: responsive enough to feel live, slow
-    /// enough not to bounce on every Slack glance.
+    /// ~20-sample effective window.
     private let engagementAlpha: Double = 0.1
 
-    /// Optional Claude Haiku analyzer. When set, every captured frame is
-    /// sent to the API, producing a safety verdict + librarian category +
-    /// short summary + raw engagement score in one call. Configured via
-    /// `configureAnalyzer(_:)` before (or during) a recording.
+    /// The sidecar is rewritten every this many frames (about once a
+    /// minute) and whenever a session pauses or ends. Rewriting on every
+    /// frame meant several GB of disk writes over a full day.
+    private let sidecarFlushInterval = 6
+
+    /// Movie fragments keep a video that was cut short by a crash or power
+    /// loss playable up to the last fragment. Measured in video time: 3 s
+    /// of video is 30 frames, about five minutes of real time.
+    private let movieFragmentInterval = CMTime(value: 3, timescale: 1)
+
+    /// Optional Claude Haiku analyzer. When set, frames that may leave the
+    /// Mac are sent to the API for a safety verdict, category, summary and
+    /// engagement score in one call.
     private var analyzer: FrameAnalyzer?
 
     // MARK: - Public state
 
     private(set) var isRecording = false
 
-    /// Counts of (safe, redacted) frames in the active recording. Reset at
-    /// each start(). Read by the UI to show "Recording… (5 safe, 1 redacted)".
+    /// Frame counts for the current session.
     private(set) var safeFrameCount: Int = 0
     private(set) var redactedFrameCount: Int = 0
 
-    /// Latest smoothed engagement value, 0-100. Drives the menu-bar
-    /// "rev meter" number. Nil when we have no samples yet.
+    /// Latest smoothed engagement value, 0-100. Nil before the first frame.
     private(set) var currentEngagement: Int?
-
-    /// Latest category the analyzer returned. Nil when we have no samples
-    /// yet. Used by the menu label and (later) Slack status push.
     private(set) var currentCategory: FrameCategory?
-
-    /// Latest one-line summary from the analyzer. Useful for tooltips and
-    /// status pushes.
     private(set) var currentSummary: String = ""
 
-    /// Called on the main actor after each frame is appended, so the UI can
-    /// refresh counters + rev meter. Set by MenuBarController.
+    /// Set while the user has paused recording from the menu.
+    private(set) var userPauseUntil: Date?
+
+    /// Called on the main actor after each frame is appended.
     var onFrameAppended: (@MainActor () -> Void)?
 
-    /// Lightweight snapshot of the currently-recording session, or nil if
-    /// we're idle. The Journal UI pulls this to render the in-progress
-    /// session row without reaching into private state.
+    /// Why capture is paused right now, or nil if it's running (or off).
+    var pauseReason: PauseReason? {
+        guard isRecording else { return nil }
+        if let until = userPauseUntil, until > Date() { return .user(until: until) }
+        if let why = SystemStateMonitor.shared.awayReason { return .away(why) }
+        return nil
+    }
+
+    var isAnalyzerEnabled: Bool { analyzer != nil }
+    var currentSessionStartedAt: Date? { session?.startedAt }
+    var currentSessionID: String? { session?.id }
+    var currentVideoFilename: String? { session?.video }
+
     var liveSnapshot: LiveSessionSnapshot? {
         guard isRecording, let s = session else { return nil }
         return LiveSessionSnapshot(
@@ -141,19 +169,25 @@ final class TimeLapseRecorder {
             safeFrames: safeFrameCount,
             redactedFrames: redactedFrameCount,
             engagement: currentEngagement,
-            topCategory: currentCategory
+            topCategory: currentCategory,
+            activeSeconds: ActivityTimeline.activeSeconds(s.frames, captureInterval: captureInterval)
         )
     }
 
     // MARK: - Paths
 
-    /// nonisolated so Journal / RetentionSweeper (plain enums, no actor
-    /// isolation) can ask for the folder. It only touches FileManager —
-    /// no MainActor state — so there's nothing to protect.
+    /// Root data folder: `~/Movies/WorkTimeLaps`, or `$WORKTIMELAPS_DATA_DIR`
+    /// when set (handy for development and tests). nonisolated because it
+    /// only touches FileManager.
     nonisolated static var recordingsFolder: URL {
-        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies")
-        let folder = movies.appendingPathComponent("WorkTimeLaps", isDirectory: true)
+        let folder: URL
+        if let override = ProcessInfo.processInfo.environment["WORKTIMELAPS_DATA_DIR"], !override.isEmpty {
+            folder = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        } else {
+            let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies")
+            folder = movies.appendingPathComponent("WorkTimeLaps", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder
     }
@@ -166,7 +200,7 @@ final class TimeLapseRecorder {
     private var captureFilter: SCContentFilter?
     private var captureConfig: SCStreamConfiguration?
 
-    // AVAssetWriter pipeline.
+    // AVAssetWriter pipeline for the current session.
     private var writer: AVAssetWriter?
     private var writerInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
@@ -175,48 +209,82 @@ final class TimeLapseRecorder {
     private var thumbURL: URL?
     private var frameIndex: Int64 = 0
     private var writerInitialized = false
+    private var thumbnailSaved = false
+    private var framesSinceFlush = 0
 
-    /// Full session state — mutated frame-by-frame, persisted after each
-    /// append and again (with summary) on stop.
+    /// The session being recorded. Nil until the first frame after start,
+    /// a pause-free rollover, or a stop.
     private var session: RecordingSession?
 
-    /// Wall-clock time of the previous frame, for sleep-gap detection.
+    /// Wall-clock time of the previous frame, for absence detection.
     private var lastFrameAt: Date?
 
     /// Running engagement EMA in Double-land to avoid rounding drift.
     private var engagementEMA: Double?
 
-    /// Activity / summary / category from the last analyzed frame. Fed
-    /// back into the next frame's analyzer prompt so the model can reuse
-    /// the same activity name verbatim and answer "is it the same?"
-    /// honestly. Reset to nil at the start of each recording.
+    /// Labels from the last analyzed frame, fed back into the next prompt
+    /// so the model can reuse the activity name and answer "same as before?".
     private var lastActivity: String?
     private var lastSummaryForPrompt: String?
     private var lastCategoryForPrompt: FrameCategory?
 
     // MARK: - Analyzer wiring
 
-    /// Install (or remove) the frame analyzer. Passing nil disables
-    /// analysis — all frames are written unchanged and the sidecar marks
-    /// them as `.other` with zero engagement. Can be called while
-    /// recording; takes effect on the next frame.
+    /// Install (or remove) the frame analyzer. Takes effect on the next frame.
     func configureAnalyzer(_ analyzer: FrameAnalyzer?) {
         self.analyzer = analyzer
     }
 
-    var isAnalyzerEnabled: Bool { analyzer != nil }
-
-    // Backwards-compatible name kept for the UI — "safety check" is how
-    // the user sees it in the menu.
-    var isSafetyCheckEnabled: Bool { analyzer != nil }
-
-    // MARK: - Start
+    // MARK: - Start / stop / pause
 
     func start() async throws {
         guard !isRecording else { throw RecorderError.alreadyRecording }
+        try await prepareCapture()
+        resetSessionState()
+        userPauseUntil = nil
+        isRecording = true
+        SystemStateMonitor.shared.start()
+        captureTask = Task { [weak self] in
+            await self?.runCaptureLoop()
+        }
+        postStateChange()
+    }
 
-        // 1. Resolve available displays via SCK. This throws if Screen
-        //    Recording permission has been denied.
+    /// Stops recording and finalizes the current session. Returns the video
+    /// URL, or nil if nothing was recorded since the last rollover.
+    @discardableResult
+    func stop() async -> URL? {
+        guard isRecording else { return nil }
+        isRecording = false
+        userPauseUntil = nil
+
+        // Cancel and wait for the loop, including any in-flight capture or
+        // analyzer call, before touching the writer.
+        if let task = captureTask {
+            task.cancel()
+            await task.value
+        }
+        captureTask = nil
+
+        let url = await finishSession()
+        postStateChange()
+        return url
+    }
+
+    /// Pause capturing until `date`; nil resumes. Recording stays on and the
+    /// session stays open, so the day's video simply skips the paused time.
+    func pause(until date: Date?) {
+        guard isRecording else { return }
+        userPauseUntil = date
+        if date != nil { flushSidecar() }
+        postStateChange()
+    }
+
+    // MARK: - Setup
+
+    private func prepareCapture() async throws {
+        // Resolve displays via SCK. Throws if Screen Recording permission
+        // has been denied.
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.current
@@ -228,7 +296,6 @@ final class TimeLapseRecorder {
             throw RecorderError.screenUnavailable(underlying: "no displays reported")
         }
 
-        // 2. Build capture configuration at the display's native pixel size.
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
         config.width = display.width
@@ -237,92 +304,62 @@ final class TimeLapseRecorder {
         config.showsCursor = true
         config.minimumFrameInterval = CMTime(value: 1, timescale: playbackFPS)
 
-        // 3. Take a test shot so permission errors surface *here* (not silently
-        //    mid-recording). captureImage throws if we lack permission.
+        // Test shot so permission errors surface here, not silently later.
         do {
             _ = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         } catch {
             throw RecorderError.screenUnavailable(underlying: error.localizedDescription)
         }
 
-        self.captureFilter = filter
-        self.captureConfig = config
-
-        // 4. Reset writer + session state and pick output paths.
-        frameIndex = 0
-        writerInitialized = false
-        writer = nil
-        writerInput = nil
-        adaptor = nil
-        safeFrameCount = 0
-        redactedFrameCount = 0
-        currentEngagement = nil
-        currentCategory = nil
-        currentSummary = ""
-        engagementEMA = nil
-        lastFrameAt = nil
-        lastActivity = nil
-        lastSummaryForPrompt = nil
-        lastCategoryForPrompt = nil
-        RedactedFrame.invalidate()
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let stem = "TimeLapse_\(formatter.string(from: Date()))"
-        let folder = Self.recordingsFolder
-        outputURL = folder.appendingPathComponent("\(stem).mp4")
-        sidecarURL = folder.appendingPathComponent("\(stem).json")
-        thumbURL = folder.appendingPathComponent("\(stem).thumb.jpg")
-
-        session = RecordingSession(
-            id: stem,
-            video: "\(stem).mp4",
-            startedAt: Date(),
-            endedAt: nil,
-            lastUpdated: Date(),
-            captureIntervalSec: captureInterval,
-            playbackFPS: Int(playbackFPS),
-            display: RecordingSession.DisplaySize(width: display.width, height: display.height),
-            frames: [],
-            summary: nil
-        )
-
-        isRecording = true
-
-        // 5. Kick off the capture loop. Cancellation (via captureTask?.cancel())
-        //    is how stop() shuts this down.
-        captureTask = Task { [weak self] in
-            await self?.runCaptureLoop()
-        }
+        captureFilter = filter
+        captureConfig = config
     }
 
     // MARK: - Capture loop
 
     private func runCaptureLoop() async {
-        // Immediate first frame so short recordings still yield content.
-        await captureOneFrame()
-
         while !Task.isCancelled && isRecording {
-            do {
-                try await Task.sleep(nanoseconds: UInt64(captureInterval * 1_000_000_000))
-            } catch {
-                // CancellationError — stop was called.
-                break
+            let tickStart = Date()
+
+            await rolloverIfWorkDayEnded(now: tickStart)
+
+            if let until = userPauseUntil, until <= tickStart {
+                userPauseUntil = nil
+                postStateChange()
             }
-            if Task.isCancelled || !isRecording { break }
-            await captureOneFrame()
+
+            if pauseReason == nil {
+                await captureOneFrame()
+            } else {
+                flushSidecar()
+            }
+
+            // Fixed rhythm: the next frame is due one interval after this one
+            // started, however long the analyzer call took.
+            let elapsed = Date().timeIntervalSince(tickStart)
+            let delay = max(0.5, captureInterval - elapsed)
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            } catch {
+                break  // CancellationError — stop() was called.
+            }
         }
+    }
+
+    /// Closes the session when the work day it started in has ended. The
+    /// next frame opens a fresh session for the new day.
+    private func rolloverIfWorkDayEnded(now: Date) async {
+        guard let s = session, WorkDay.key(for: s.startedAt) != WorkDay.key(for: now) else { return }
+        await finishSession()
+        resetSessionState()
+        postStateChange()
     }
 
     private func captureOneFrame() async {
         guard isRecording, let filter = captureFilter, let config = captureConfig else { return }
 
-        // Sample the foreground context *before* the screenshot so the
-        // captured pixels and the rule-engine context line up — if the
-        // user switches apps in the millisecond between probe and capture
-        // we'd rather under-redact than over-redact (the per-frame analyzer
-        // still has the privacy-tag fallback).
+        // Sample the foreground context *before* the screenshot so the rule
+        // check lines up with the captured pixels.
         let workContext = WorkContextProbe.current()
 
         let image: CGImage
@@ -333,62 +370,56 @@ final class TimeLapseRecorder {
             return
         }
 
-        // After the await we may have been asked to stop; don't append to a
-        // writer that's about to be finalized.
-        guard isRecording else { return }
+        // We may have been stopped or paused during the await.
+        guard isRecording, pauseReason == nil else { return }
 
+        let now = Date()
+        if session == nil {
+            openSession(at: now, width: image.width, height: image.height)
+        }
         if !writerInitialized {
             do {
                 try initializeWriter(width: image.width, height: image.height)
                 writerInitialized = true
-                // First-frame thumbnail. Best-effort — failure just means no
-                // preview in the future calendar UI.
-                saveThumbnail(image)
             } catch {
                 NSLog("WorkTimeLaps: writer init failed: \(error.localizedDescription)")
                 return
             }
         }
 
-        // Sleep / lid-close detection. If this frame lands suspiciously late
-        // compared to the previous one, we record the gap and force
-        // engagement to 0 — the computer wasn't actually doing anything
-        // during that stretch.
-        let now = Date()
+        // A long gap since the previous frame means the user was away (Mac
+        // asleep, screen locked, paused). Engagement restarts from 0.
         var sleepGapSec: Double? = nil
         if let prev = lastFrameAt {
             let elapsed = now.timeIntervalSince(prev)
-            if elapsed > captureInterval * sleepGapMultiplier {
+            if elapsed > ActivityTimeline.gapThreshold(for: captureInterval) {
                 sleepGapSec = elapsed
             }
         }
 
-        // Run the analyzer (if configured). Fail-closed: redact on any
-        // error so a flaky network can't silently disable the filter.
-        let analysis: FrameAnalysis?
-        var redactionReason: String? = nil
-        var sleepOverride = false
+        // Decide whether this frame may leave the Mac at all. Our own windows
+        // (Journal, Highlights, Diary) and blocked apps/windows are never
+        // sent to the analyzer — only logged with a generic label.
+        let isSelfReading = workContext.bundleID == Bundle.main.bundleIdentifier
+        let blockedRule = isSelfReading
+            ? nil
+            : PrivacyRulesStore.match(bundleID: workContext.bundleID, windowTitle: workContext.windowTitle)
 
-        if let analyzer = analyzer {
-            // Previous-frame context lets the model reuse the same activity
-            // verbatim and answer sameAsBefore honestly. Vocabulary is the
-            // 2-hour rolling list that pushes labels toward consistency.
+        var analysis: FrameAnalysis?
+        var analyzerFailure: String?
+        if let analyzer = analyzer, !isSelfReading, blockedRule == nil {
             let previous: FrameAnalyzer.PreviousFrameContext? = {
                 guard let act = lastActivity,
                       let summary = lastSummaryForPrompt,
                       let cat = lastCategoryForPrompt else { return nil }
                 return FrameAnalyzer.PreviousFrameContext(activity: act, summary: summary, category: cat)
             }()
-            let vocabulary = ActivityVocabulary.recent()
-
-            // Pass the macOS account holder's full name into the prompt
-            // so the model has an explicit identity to anchor the
-            // "addressed to me" check on. Without this it tends to
-            // assume any praise visible on screen is for the user.
+            // The account holder's full name anchors the "addressed to me"
+            // check for recognition.
             let outcome = await analyzer.analyze(
                 image: image,
                 previous: previous,
-                vocabulary: vocabulary,
+                vocabulary: ActivityVocabulary.recent(),
                 userName: NSFullUserName()
             )
             guard isRecording else { return }
@@ -397,151 +428,92 @@ final class TimeLapseRecorder {
                 analysis = a
             case .failed(let reason):
                 NSLog("WorkTimeLaps: analyzer failed (\(reason)) — redacting frame")
-                redactionReason = "analyzer failed: \(reason)"
-                analysis = nil
+                analyzerFailure = reason
             }
-        } else {
-            analysis = nil
         }
 
-        // Decide what to write to the MP4 and what to record in the sidecar.
-        let frameToWrite: CGImage
-        let isRedacted: Bool
-        let rawEngagement: Int
+        // What to write to the MP4 and the sidecar.
+        var redactionReason: String?
         let category: FrameCategory
         let summaryText: String
         let activityText: String
+        let rawEngagement: Int
+        // Frames we don't analyze keep the meter where it was.
+        let carriedEngagement = Int((engagementEMA ?? 0).rounded())
 
-        // Context-blocklist match: app bundle id or window title hits a
-        // user-configured rule. This is independent of analyzer output —
-        // it's a hard "this kind of context never gets recorded" signal.
-        // Evaluated here so we can know it before writing the sidecar even
-        // if the analyzer call fails-closed below.
-        let blockedRule = PrivacyRulesStore.match(bundleID: workContext.bundleID,
-                                                  windowTitle: workContext.windowTitle)
-
-        // Built-in self-block: if our own app is the frontmost window
-        // (the user reviewing Highlights / Journal / Settings), redact
-        // and skip recognition. Otherwise we'd loop on ourselves —
-        // logging quotes from the brag sheet as new "recognitions"
-        // every time the user opens it. Hardcoded rather than
-        // user-toggleable because there is no good reason to record
-        // ourselves recording.
-        let isSelfReading = workContext.bundleID == Bundle.main.bundleIdentifier
-
-        if let a = analysis {
-            // Four redaction triggers, in priority order:
-            //  1. Credential leak (`!a.safe`) — fail-hard, never overridable.
-            //  2. Self-reading — built-in, can't be turned off.
-            //  3. Context blocklist — user-declared "never record this app
-            //     or window," sanitized summary so even the metadata stays
-            //     generic.
-            //  4. Privacy tag — Haiku-judged content category.
+        if isSelfReading {
+            redactionReason = "blocked:self"
+            category = .other
+            summaryText = "Reviewing WorkTimeLaps"
+            activityText = "WorkTimeLaps"
+            rawEngagement = carriedEngagement
+        } else if let rule = blockedRule {
+            // Category guessed from the rule; summary kept generic so a DM
+            // thread can't leak through the log.
+            redactionReason = "blocked:\(rule.kind.rawValue):\(rule.pattern)"
+            category = PrivacyRulesStore.category(for: rule)
+            summaryText = category.display
+            activityText = category.display
+            rawEngagement = carriedEngagement
+        } else if let a = analysis {
+            // Redaction triggers, highest priority first: a visible secret
+            // (never overridable), then an enabled privacy filter.
             if !a.safe {
                 redactionReason = "secret visible"
-                frameToWrite = RedactedFrame.image(width: image.width, height: image.height) ?? image
-                isRedacted = true
-            } else if isSelfReading {
-                redactionReason = "blocked:self"
-                frameToWrite = RedactedFrame.image(width: image.width, height: image.height) ?? image
-                isRedacted = true
-            } else if let rule = blockedRule {
-                redactionReason = "blocked:\(rule.kind.rawValue):\(rule.pattern)"
-                frameToWrite = RedactedFrame.image(width: image.width, height: image.height) ?? image
-                isRedacted = true
             } else if PrivacyFilterStore.shouldRedact(a.privacy) {
                 redactionReason = "privacy:\(a.privacy.rawValue)"
-                frameToWrite = RedactedFrame.image(width: image.width, height: image.height) ?? image
-                isRedacted = true
-            } else {
-                frameToWrite = image
-                isRedacted = false
             }
             category = a.category
-            // Summary is already generic for non-none privacy per the
-            // analyzer's prompt. For context-blocklist or self-reading
-            // hits the analyzer *doesn't* know to be generic, so we
-            // sanitize client-side — the category display is enough to
-            // keep "X% of the day in category Y" honest without leaking
-            // specifics from a DM thread.
-            let modelSummary: String
-            if (blockedRule != nil || isSelfReading) && a.safe && !PrivacyFilterStore.shouldRedact(a.privacy) {
-                modelSummary = isSelfReading ? "Reviewing WorkTimeLaps" : a.category.display
-            } else {
-                modelSummary = a.summary
-            }
 
-            // Activity resolution. Cases in priority order:
-            //   1. Self-reading — fixed activity name, no vocabulary churn.
-            //   2. Blocked context — image is redacted, so the activity
-            //      label should be the category display rather than a
-            //      specific tool name. Same reason we sanitize the summary.
-            //   3. sameAsBefore — model says nothing meaningful changed;
-            //      reuse the previous frame's activity + summary verbatim
-            //      so clusters stay stable across rephrase noise.
-            //   4. Otherwise — validate the model's activity (deny-list +
-            //      shape). On failure fall back to the category display.
-            //      On success record into the rolling vocabulary.
-            let resolvedActivity: String
-            let resolvedSummary: String
-            if isSelfReading {
-                resolvedActivity = "WorkTimeLaps"
-                resolvedSummary = modelSummary
-            } else if blockedRule != nil {
-                resolvedActivity = a.category.display
-                resolvedSummary = modelSummary
-            } else if a.sameAsBefore, let prev = lastActivity, !prev.isEmpty {
-                resolvedActivity = prev
-                resolvedSummary = lastSummaryForPrompt ?? modelSummary
+            // Activity resolution: reuse the previous label when the model
+            // says nothing changed; otherwise validate the new one and fall
+            // back to the category name if it's too generic.
+            if a.sameAsBefore, let prev = lastActivity, !prev.isEmpty {
+                activityText = prev
+                summaryText = lastSummaryForPrompt ?? a.summary
             } else if let validated = ActivityVocabulary.validate(a.activity) {
-                resolvedActivity = validated
-                resolvedSummary = modelSummary
-                ActivityVocabulary.record(name: validated, summary: modelSummary)
+                activityText = validated
+                summaryText = a.summary
+                ActivityVocabulary.record(name: validated, summary: a.summary)
             } else {
-                resolvedActivity = a.category.display
-                resolvedSummary = modelSummary
+                activityText = a.category.display
+                summaryText = a.summary
             }
-            summaryText = resolvedSummary
-            activityText = resolvedActivity
 
             // Category-weighted ceiling keeps the meter honest: "deep work"
             // on a media player shouldn't read 90.
-            let capped = Double(a.engagement) * a.category.activityWeight
-            rawEngagement = Int(capped.rounded())
+            rawEngagement = Int((Double(a.engagement) * a.category.activityWeight).rounded())
         } else if analyzer != nil {
-            // Fail-closed: redact + zero out the meter, but keep writing so
-            // the user still gets a continuous video.
-            frameToWrite = RedactedFrame.image(width: image.width, height: image.height) ?? image
-            isRedacted = true
+            // Fail-closed: a flaky network must never disable redaction.
+            redactionReason = "analyzer failed: \(analyzerFailure ?? "unknown")"
             category = .other
             summaryText = ""
             activityText = ""
             rawEngagement = 0
         } else {
-            // No analyzer configured — pass the frame through, meter stays
-            // idle.
+            // No API key: frames pass through, the meter stays idle.
+            category = .other
+            summaryText = ""
+            activityText = ""
+            rawEngagement = 0
+        }
+
+        let isRedacted = redactionReason != nil
+        let frameToWrite: CGImage
+        if isRedacted {
+            // Never fall back to the real image for a redacted frame.
+            guard let placeholder = RedactedFrame.image(width: image.width, height: image.height) else {
+                NSLog("WorkTimeLaps: couldn't render redaction placeholder — dropping frame")
+                return
+            }
+            frameToWrite = placeholder
+        } else {
             frameToWrite = image
-            isRedacted = false
-            category = .other
-            summaryText = ""
-            activityText = ""
-            rawEngagement = 0
         }
 
-        // Force engagement to 0 across a detected sleep gap even if the
-        // model scored the wake-up frame high.
-        let engagementForThisFrame: Int
-        if sleepGapSec != nil {
-            engagementForThisFrame = 0
-            sleepOverride = true
-        } else {
-            engagementForThisFrame = rawEngagement
-        }
-
-        // EMA smoothing. A sleep gap also resets the EMA so we don't carry
-        // yesterday's tachometer reading into today.
+        let engagementForThisFrame = sleepGapSec != nil ? 0 : rawEngagement
         let smoothed: Int
-        if sleepOverride || engagementEMA == nil {
+        if sleepGapSec != nil || engagementEMA == nil {
             engagementEMA = Double(engagementForThisFrame)
             smoothed = engagementForThisFrame
         } else {
@@ -552,10 +524,15 @@ final class TimeLapseRecorder {
         }
 
         guard let appendedIndex = appendFrame(frameToWrite) else {
-            // Writer couldn't accept this frame — don't update counters, don't
-            // write a sidecar entry, don't advance lastFrameAt (so we'll
-            // re-detect the sleep gap if one was in progress).
+            // Writer couldn't take the frame — skip the log entry too.
             return
+        }
+
+        // Thumbnail from the first frame that isn't redacted, so the preview
+        // never shows something the video hides.
+        if !thumbnailSaved && !isRedacted {
+            saveThumbnail(frameToWrite)
+            thumbnailSaved = true
         }
 
         if isRedacted {
@@ -567,43 +544,37 @@ final class TimeLapseRecorder {
         currentCategory = category
         currentSummary = summaryText
         lastFrameAt = now
-        // Remember this frame's labels so the next frame's analyzer prompt
-        // can ask "is it the same?" against meaningful values.
         lastActivity = activityText.isEmpty ? nil : activityText
         lastSummaryForPrompt = summaryText.isEmpty ? nil : summaryText
         lastCategoryForPrompt = category
 
-        // Update the session sidecar. We rewrite the whole blob each time —
-        // cheap at these sizes and means a crash leaves a valid file.
-        if var s = session {
-            let entry = FrameEntry(
-                i: appendedIndex,
-                t: now,
-                category: category,
-                summary: summaryText,
-                engagement: engagementForThisFrame,
-                engagementSmoothed: smoothed,
-                redacted: isRedacted,
-                redactionReason: isRedacted ? (redactionReason ?? "unknown") : nil,
-                sleepGapSec: sleepGapSec,
-                activity: activityText.isEmpty ? nil : activityText
-            )
-            s.frames.append(entry)
-            s.lastUpdated = now
-            session = s
-            persistSidecar()
+        // Mutate in place — copying the session out and back would copy the
+        // whole frame array on every frame.
+        session?.frames.append(FrameEntry(
+            i: appendedIndex,
+            t: now,
+            category: category,
+            summary: summaryText,
+            engagement: engagementForThisFrame,
+            engagementSmoothed: smoothed,
+            redacted: isRedacted,
+            redactionReason: redactionReason,
+            sleepGapSec: sleepGapSec,
+            activity: activityText.isEmpty ? nil : activityText
+        ))
+        session?.lastUpdated = now
+        framesSinceFlush += 1
+        if session?.frames.count == 1 || framesSinceFlush >= sidecarFlushInterval {
+            flushSidecar()
         }
 
-        // Recognition logging — only on un-redacted frames where the
-        // model fired the strict rubric. Skipping redacted frames means
-        // every entry in the brag sheet has a viewable source frame for
-        // later verification, and we don't risk preserving a quote we
-        // can't substantiate.
+        // Recognition — only from analyzed, unredacted frames, so every
+        // entry on the brag sheet has a viewable source frame.
         if let a = analysis,
            a.recognitionLevel != .none,
            !isRedacted,
            !a.recognitionQuote.isEmpty {
-            let recognition = Recognition(
+            RecognitionStore.append(Recognition(
                 id: UUID().uuidString,
                 capturedAt: now,
                 level: a.recognitionLevel,
@@ -615,15 +586,121 @@ final class TimeLapseRecorder {
                 category: category,
                 sessionID: session?.id,
                 frameIndex: appendedIndex
-            )
-            RecognitionStore.append(recognition)
+            ))
         }
 
         onFrameAppended?()
         NotificationCenter.default.post(name: .worktimelapsFrameAppended, object: nil)
     }
 
-    // MARK: - Writer setup
+    // MARK: - Sessions
+
+    private func openSession(at now: Date, width: Int, height: Int) {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let stem = "TimeLapse_\(formatter.string(from: now))"
+        let folder = Self.recordingsFolder
+        outputURL = folder.appendingPathComponent("\(stem).mp4")
+        sidecarURL = folder.appendingPathComponent("\(stem).json")
+        thumbURL = folder.appendingPathComponent("\(stem).thumb.jpg")
+
+        session = RecordingSession(
+            id: stem,
+            video: "\(stem).mp4",
+            startedAt: now,
+            endedAt: nil,
+            lastUpdated: now,
+            captureIntervalSec: captureInterval,
+            playbackFPS: Int(playbackFPS),
+            display: RecordingSession.DisplaySize(width: width, height: height),
+            frames: [],
+            summary: nil
+        )
+        frameIndex = 0
+        writerInitialized = false
+        thumbnailSaved = false
+        framesSinceFlush = 0
+        safeFrameCount = 0
+        redactedFrameCount = 0
+    }
+
+    /// Finalizes the video, writes the session summary and journal entry.
+    /// Returns the video URL when a playable file was written.
+    @discardableResult
+    private func finishSession() async -> URL? {
+        guard var s = session else {
+            resetWriter()
+            return nil
+        }
+
+        var videoURL: URL?
+        if writerInitialized, frameIndex > 0, let writer = writer, let input = writerInput {
+            input.markAsFinished()
+            await writer.finishWriting()
+            if writer.status == .completed {
+                videoURL = outputURL
+            } else {
+                NSLog("WorkTimeLaps: video finalize failed: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+            }
+        } else {
+            writer?.cancelWriting()
+            if let url = outputURL { try? FileManager.default.removeItem(at: url) }
+        }
+
+        if let last = s.frames.last {
+            let endedAt = min(Date(), last.t.addingTimeInterval(captureInterval))
+            s.endedAt = endedAt
+            s.lastUpdated = endedAt
+            s.summary = SessionSummary.make(frames: s.frames, captureInterval: captureInterval)
+            session = s
+            flushSidecar()
+            Journal.append(session: s)
+            NotificationCenter.default.post(name: .worktimelapsSessionCompleted, object: nil)
+        } else if let url = sidecarURL {
+            // Nothing was recorded; don't leave an empty session behind.
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        session = nil
+        resetWriter()
+        return videoURL
+    }
+
+    private func resetSessionState() {
+        session = nil
+        resetWriter()
+        safeFrameCount = 0
+        redactedFrameCount = 0
+        currentEngagement = nil
+        currentCategory = nil
+        currentSummary = ""
+        engagementEMA = nil
+        lastFrameAt = nil
+        lastActivity = nil
+        lastSummaryForPrompt = nil
+        lastCategoryForPrompt = nil
+        RedactedFrame.invalidate()
+    }
+
+    private func resetWriter() {
+        writer = nil
+        writerInput = nil
+        adaptor = nil
+        outputURL = nil
+        sidecarURL = nil
+        thumbURL = nil
+        frameIndex = 0
+        writerInitialized = false
+        thumbnailSaved = false
+        framesSinceFlush = 0
+    }
+
+    private func postStateChange() {
+        NotificationCenter.default.post(name: .worktimelapsRecorderStateChanged, object: nil)
+    }
+
+    // MARK: - Writer
 
     private func initializeWriter(width: Int, height: Int) throws {
         guard let url = outputURL else {
@@ -637,9 +714,10 @@ final class TimeLapseRecorder {
         } catch {
             throw RecorderError.writerFailed(error.localizedDescription)
         }
+        writer.movieFragmentInterval = movieFragmentInterval
 
-        // H.264 — broadly compatible. 3 Mbps is plenty for screen content at
-        // 10 fps; keyframe every 4 seconds so scrubbing stays responsive.
+        // H.264 — broadly compatible. Keyframe every 4 seconds of video so
+        // scrubbing stays responsive.
         let compressionSettings: [String: Any] = [
             AVVideoAverageBitRateKey: videoBitrate,
             AVVideoExpectedSourceFrameRateKey: Int(playbackFPS),
@@ -678,9 +756,8 @@ final class TimeLapseRecorder {
         self.adaptor = adaptor
     }
 
-    /// Returns the index of the appended frame on success, or nil if the
-    /// writer wasn't ready / pixel buffer creation failed. Callers use the
-    /// nil return to skip counter + sidecar updates for the dropped frame.
+    /// Returns the index of the appended frame, or nil if the writer wasn't
+    /// ready or the pixel buffer couldn't be created.
     private func appendFrame(_ image: CGImage) -> Int64? {
         guard let adaptor = adaptor, let input = writerInput else { return nil }
 
@@ -696,19 +773,19 @@ final class TimeLapseRecorder {
 
         let appendedIndex = frameIndex
         let time = CMTime(value: frameIndex, timescale: playbackFPS)
-        adaptor.append(buffer, withPresentationTime: time)
+        guard adaptor.append(buffer, withPresentationTime: time) else {
+            NSLog("WorkTimeLaps: append failed: \(writer?.error?.localizedDescription ?? "unknown")")
+            return nil
+        }
         frameIndex += 1
         return appendedIndex
     }
 
     // MARK: - Thumbnail
 
-    /// Writes the first captured frame to `<stem>.thumb.jpg` so the future
-    /// calendar UI has something to show in a recording block without
-    /// having to decode the MP4.
+    /// Writes `<stem>.thumb.jpg` (400 px on the long side) for the Journal.
     private func saveThumbnail(_ image: CGImage) {
         guard let url = thumbURL else { return }
-        // Scale down the long side to 400 px — plenty for a calendar tile.
         let maxDim = 400
         let longest = max(image.width, image.height)
         let scale = longest > maxDim ? Double(maxDim) / Double(longest) : 1.0
@@ -739,88 +816,15 @@ final class TimeLapseRecorder {
         _ = CGImageDestinationFinalize(dest)
     }
 
-    // MARK: - Sidecar persistence
+    // MARK: - Sidecar
 
-    private func persistSidecar() {
-        guard let s = session, let url = sidecarURL else { return }
+    private func flushSidecar() {
+        guard let s = session, let url = sidecarURL, !s.frames.isEmpty else { return }
         do {
             try SessionWriter.write(s, to: url)
+            framesSinceFlush = 0
         } catch {
             NSLog("WorkTimeLaps: sidecar write failed: \(error.localizedDescription)")
         }
-    }
-
-    // MARK: - Stop
-
-    func stop() async throws -> URL {
-        guard isRecording else { throw RecorderError.notRecording }
-
-        isRecording = false
-
-        // Cancel and wait for the capture loop to exit. `await .value` on a
-        // Task<Void, Never> resolves once the task is actually done, including
-        // any in-flight SCK / analyzer call that has to complete naturally.
-        if let task = captureTask {
-            task.cancel()
-            await task.value
-        }
-        captureTask = nil
-
-        guard let writer = writer, let input = writerInput, let url = outputURL else {
-            throw RecorderError.writerFailed("no writer was created")
-        }
-        guard writerInitialized, frameIndex > 0 else {
-            throw RecorderError.writerFailed("no frames captured — did Screen Recording permission get revoked mid-recording?")
-        }
-
-        input.markAsFinished()
-        await writer.finishWriting()
-
-        // Finalize session sidecar: compute summary, stamp endedAt, persist,
-        // then append to the day-journal.
-        if var s = session {
-            let endedAt = Date()
-            s.endedAt = endedAt
-            s.lastUpdated = endedAt
-            s.summary = Self.makeSummary(frames: s.frames)
-            session = s
-            persistSidecar()
-            Journal.append(session: s)
-            NotificationCenter.default.post(name: .worktimelapsSessionCompleted, object: nil)
-        }
-
-        switch writer.status {
-        case .completed:
-            return url
-        default:
-            throw RecorderError.writerFailed(writer.error?.localizedDescription ?? "unknown writer failure (status \(writer.status.rawValue))")
-        }
-    }
-
-    // MARK: - Summary
-
-    private static func makeSummary(frames: [FrameEntry]) -> SessionSummary {
-        let total = frames.count
-        let redacted = frames.filter { $0.redacted }.count
-        let safe = total - redacted
-
-        var counts: [String: Int] = [:]
-        var engagementSum = 0
-        for f in frames {
-            counts[f.category.rawValue, default: 0] += 1
-            engagementSum += f.engagementSmoothed
-        }
-        let avg = total == 0 ? 0 : Int((Double(engagementSum) / Double(total)).rounded())
-        let top = counts.max(by: { $0.value < $1.value })?.key ?? FrameCategory.other.rawValue
-        let topCategory = FrameCategory(rawValue: top) ?? .other
-
-        return SessionSummary(
-            totalFrames: total,
-            safeFrames: safe,
-            redactedFrames: redacted,
-            averageEngagement: avg,
-            topCategory: topCategory,
-            categoryCounts: counts
-        )
     }
 }

@@ -1,111 +1,79 @@
 import Foundation
 
-/// Size-quota pruner for the recordings folder.
+/// Age-based cleanup of the recordings folder.
 ///
-/// Policy: users set a cap in GB (default 10, or unlimited). When the total
-/// size of MP4 files exceeds the cap, oldest-first MP4s are deleted along
-/// with their matching sidecar (`<stem>.json`) and thumbnail
-/// (`<stem>.thumb.jpg`) until we're back under quota. The day-journal
-/// directory (`_journal/`) is *never* touched — that's the long-term memory
-/// the future reviewer reads from.
+/// Policy: videos (`TimeLapse_*.mp4`) and their thumbnails
+/// (`TimeLapse_*.thumb.jpg`) older than the retention period — 48 hours by
+/// default — are deleted. Everything that's text stays: session sidecars
+/// (the frame log), the journal, diaries, highlights and the activity
+/// vocabulary. That keeps disk use flat (a couple of GB at most) while the
+/// long-term record keeps growing by a few hundred KB a day.
 ///
-/// This is a deliberately simple policy: oldest-first, MP4-weighted. We
-/// don't try to be clever about keeping "interesting" days; disk space is
-/// the only signal we've got at this layer, and the journal preserves the
-/// gist of what was recorded even after the video is gone.
+/// Runs at launch, after every session ends, hourly while the app is open,
+/// and whenever the setting changes.
 enum RetentionSweeper {
 
-    /// UserDefaults key holding the quota, in bytes. Absent = default 10 GB.
-    /// A stored value of 0 means "unlimited" (sweeper is a no-op).
-    static let quotaKey = "WorkTimeLaps.retentionQuotaBytes"
+    static let retentionKey = "WorkTimeLaps.videoRetentionHours"
+    static let defaultRetentionHours = 48
 
-    /// 10 GB default. Chosen to fit comfortably on most laptops while
-    /// covering ~6 weeks of 8-hour days at 3 Mbps — roughly what the user
-    /// asked for up front.
-    static let defaultQuotaBytes: Int64 = 10 * 1024 * 1024 * 1024
+    static let options: [(label: String, hours: Int)] = [
+        ("1 day", 24),
+        ("2 days", 48),
+        ("1 week", 24 * 7),
+        ("30 days", 24 * 30)
+    ]
 
-    static var quotaBytes: Int64 {
-        let stored = UserDefaults.standard.object(forKey: quotaKey) as? Int64
-        return stored ?? defaultQuotaBytes
-    }
-
-    static func setQuotaBytes(_ bytes: Int64) {
-        UserDefaults.standard.set(bytes, forKey: quotaKey)
-    }
-
-    /// Human-friendly label for the current setting. Used by the menu.
-    static var currentLabel: String {
-        let q = quotaBytes
-        if q <= 0 { return "Unlimited" }
-        let gb = Double(q) / Double(1024 * 1024 * 1024)
-        if gb >= 1 {
-            return String(format: "%.0f GB", gb)
+    static var retentionHours: Int {
+        get {
+            guard let stored = UserDefaults.standard.object(forKey: retentionKey) as? Int, stored > 0 else {
+                return defaultRetentionHours
+            }
+            return stored
         }
-        let mb = Double(q) / Double(1024 * 1024)
-        return String(format: "%.0f MB", mb)
+        set { UserDefaults.standard.set(max(1, newValue), forKey: retentionKey) }
     }
 
-    /// Run the sweep. Safe to call from any thread; no UI interaction.
-    /// Returns the number of MP4 files deleted (useful for logging / tests).
-    @discardableResult
-    static func sweep() -> Int {
-        let quota = quotaBytes
-        if quota <= 0 { return 0 }   // unlimited
+    static var currentLabel: String {
+        options.first(where: { $0.hours == retentionHours })?.label ?? "\(retentionHours) hours"
+    }
 
+    /// Deletes expired videos and thumbnails. `protectedFiles` (file names
+    /// of the recording in progress) are never touched. Returns the number
+    /// of files deleted.
+    @discardableResult
+    static func sweep(now: Date = Date(), protecting protectedFiles: Set<String> = []) -> Int {
+        let cutoff = now.addingTimeInterval(-Double(retentionHours) * 3600)
         let folder = TimeLapseRecorder.recordingsFolder
         let fm = FileManager.default
 
-        struct Entry {
-            let url: URL
-            let size: Int64
-            let mtime: Date
-        }
-
-        // Only consider top-level MP4s. Sidecars/thumbnails follow along on
-        // delete; the `_journal/` subdirectory is skipped entirely.
+        // Top level only — `_journal/` is never visited.
         guard let contents = try? fm.contentsOfDirectory(
             at: folder,
-            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey],
+            includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
         ) else { return 0 }
 
-        var mp4s: [Entry] = []
-        var totalMP4Bytes: Int64 = 0
-
-        for url in contents where url.pathExtension.lowercased() == "mp4" {
-            let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            let size = Int64(vals?.fileSize ?? 0)
-            let mtime = vals?.contentModificationDate ?? .distantPast
-            mp4s.append(Entry(url: url, size: size, mtime: mtime))
-            totalMP4Bytes += size
-        }
-
-        guard totalMP4Bytes > quota else { return 0 }
-
-        // Oldest first.
-        mp4s.sort { $0.mtime < $1.mtime }
-
         var deleted = 0
-        var running = totalMP4Bytes
+        for url in contents {
+            let name = url.lastPathComponent
+            guard name.hasPrefix("TimeLapse_"),
+                  name.hasSuffix(".mp4") || name.hasSuffix(".thumb.jpg"),
+                  !protectedFiles.contains(name) else { continue }
 
-        for entry in mp4s {
-            if running <= quota { break }
-            let stem = entry.url.deletingPathExtension().lastPathComponent
-            let sidecar = folder.appendingPathComponent("\(stem).json")
-            let thumb = folder.appendingPathComponent("\(stem).thumb.jpg")
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantFuture
+            guard modified < cutoff else { continue }
 
             do {
-                try fm.removeItem(at: entry.url)
-                running -= entry.size
+                try fm.removeItem(at: url)
                 deleted += 1
-                try? fm.removeItem(at: sidecar)
-                try? fm.removeItem(at: thumb)
-                NSLog("WorkTimeLaps: pruned \(entry.url.lastPathComponent) (\(entry.size) bytes)")
             } catch {
-                NSLog("WorkTimeLaps: failed to prune \(entry.url.lastPathComponent): \(error.localizedDescription)")
+                NSLog("WorkTimeLaps: couldn't delete expired \(name): \(error.localizedDescription)")
             }
         }
-
+        if deleted > 0 {
+            NSLog("WorkTimeLaps: deleted \(deleted) video file(s) older than \(retentionHours) h")
+        }
         return deleted
     }
 }
