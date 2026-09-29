@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/NiklasPromtech/WorkTimeLaps/actions/workflows/build.yml"><img src="https://github.com/NiklasPromtech/WorkTimeLaps/actions/workflows/build.yml/badge.svg" alt="Build and test"></a>
+  <img src="https://img.shields.io/badge/macOS-14%2B-blue" alt="macOS 14+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
+</p>
+
+<p align="center">
   <img src="docs/diary.jpg" width="820" alt="A diary page: headline, a short first-person entry, highlights, where the time went, a timeline, kind words and loose ends">
 </p>
 
@@ -78,7 +84,7 @@ open /Applications/WorkTimeLaps.app
 
 On first launch a welcome window walks you through the API key, Screen Recording access and the login item. Recording starts when you click **Start Recording**.
 
-**Signing and permissions.** macOS ties Screen Recording access, and access to the app's keychain item, to the app's signing identity. `build.sh` signs with your Apple Development certificate when you have one (Xcode creates one for free when you add an Apple ID under Settings → Accounts), so permissions survive rebuilds. Without one it signs ad hoc, and every rebuild looks like a new app to macOS:
+**Signing and permissions.** macOS ties Screen Recording access, and access to the app's keychain item, to the app's signing identity. `build.sh` signs with your Apple Development certificate when you have one, so permissions survive rebuilds. It's free: in Xcode, open **Settings → Accounts**, add your Apple ID, then **Manage Certificates… → + → Apple Development**. Without one it signs ad hoc, and every rebuild looks like a new app to macOS:
 
 - The old Screen Recording entry stays switched on but no longer applies. Select WorkTimeLaps in **System Settings → Privacy & Security → Screen & System Audio Recording**, remove it with **–**, and grant access again (or run `tccutil reset ScreenCapture com.niklas.worktimelaps`).
 - macOS may ask whether WorkTimeLaps can read its keychain item. Choose **Always Allow**.
@@ -89,7 +95,7 @@ Once access is granted, recording starts on its own; if it doesn't, choose **Qui
 
 ## Using it
 
-The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score).
+The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The shortcuts below work while the menu is open.
 
 - **Stop / Start Recording**, and **Pause** for 15 minutes, an hour, or until tomorrow.
 - **Latest Diary…** (⌘D) opens the Diary on the most recent finished day. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.
@@ -166,6 +172,10 @@ Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.
 - Records the main display only.
 - Built from source and not notarized — see the signing notes above.
 - Frame labels come from a model looking at screenshots, so they're sometimes vague or wrong. The diary is told to trust patterns over single frames, but read it as a draft of your day, not a record.
+
+## Contributing
+
+Issues and pull requests are welcome. Please run `./scripts/test.sh` before opening a pull request; CI runs the same build and tests on every push.
 
 ## License
 
