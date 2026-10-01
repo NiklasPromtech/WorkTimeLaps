@@ -173,7 +173,7 @@ There's no Xcode project: `build.sh` compiles everything with `swiftc`. To work 
 swift scripts/make-icon.swift   # regenerate Resources/AppIcon.icns
 ```
 
-Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.app` keeps test recordings out of `~/Movies`. Tuning knobs (playback rate, bitrate) are at the top of `TimeLapseRecorder.swift`.
+Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.app` keeps test recordings out of `~/Movies`. To see what the app is doing, including any errors, run `log show --last 1h --predicate 'subsystem == "com.niklas.worktimelaps"'` or filter Console.app by that subsystem. Tuning knobs (playback rate, bitrate) are at the top of `TimeLapseRecorder.swift`.
 
 ## Limitations
 

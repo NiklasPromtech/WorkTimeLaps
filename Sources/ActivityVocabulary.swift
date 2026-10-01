@@ -173,7 +173,7 @@ enum ActivityVocabulary {
             let data = try encoder.encode(entries)
             try data.write(to: fileURL, options: .atomic)
         } catch {
-            NSLog("WorkTimeLaps: activity vocabulary write failed: \(error.localizedDescription)")
+            AppLog.error("activity vocabulary write failed: \(error.localizedDescription)")
         }
     }
 

@@ -208,7 +208,7 @@ final class DiaryScheduler {
                 DiaryStore.updateStatus(for: dayKey) { $0.lastError = nil }
             } catch {
                 let message = error.localizedDescription
-                NSLog("WorkTimeLaps: diary for \(dayKey) failed: \(message)")
+                AppLog.error("diary for \(dayKey) failed: \(message)")
                 DiaryStore.updateStatus(for: dayKey) { $0.lastError = message }
                 lastErrors[dayKey] = message
                 if let existing = DiaryStore.load(dayKey: dayKey) {
@@ -226,7 +226,7 @@ final class DiaryScheduler {
         do {
             try DiaryStore.save(diary)
         } catch {
-            NSLog("WorkTimeLaps: couldn't save diary for \(dayKey): \(error.localizedDescription)")
+            AppLog.error("couldn't save diary for \(dayKey): \(error.localizedDescription)")
             return nil
         }
         if notify {
@@ -300,7 +300,7 @@ final class DiaryScheduler {
         let request = UNNotificationRequest(identifier: "diary-\(diary.dayKey)", content: content, trigger: trigger)
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
-                NSLog("WorkTimeLaps: couldn't schedule diary notification: \(error.localizedDescription)")
+                AppLog.error("couldn't schedule diary notification: \(error.localizedDescription)")
             }
         }
         DiaryStore.updateStatus(for: diary.dayKey) { $0.notificationDeliverAt = effectiveDeliver }

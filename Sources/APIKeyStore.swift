@@ -74,7 +74,7 @@ enum APIKeyStore {
               let data = item as? Data,
               let key = String(data: data, encoding: .utf8) else {
             if status != errSecItemNotFound {
-                NSLog("WorkTimeLaps: keychain read failed (\(status))")
+                AppLog.error("keychain read failed (\(status))")
             }
             return nil
         }
@@ -94,7 +94,7 @@ enum APIKeyStore {
             status = SecItemAdd(add as CFDictionary, nil)
         }
         if status != errSecSuccess {
-            NSLog("WorkTimeLaps: keychain write failed (\(status))")
+            AppLog.error("keychain write failed (\(status))")
         }
         return status == errSecSuccess
     }

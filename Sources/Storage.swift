@@ -48,10 +48,10 @@ enum JSONFile {
             .appendingPathComponent("\(stem).unreadable-\(f.string(from: Date())).json")
         do {
             try FileManager.default.moveItem(at: url, to: target)
-            NSLog("WorkTimeLaps: moved unreadable \(url.lastPathComponent) aside to \(target.lastPathComponent)")
+            AppLog.error("moved unreadable \(url.lastPathComponent) aside to \(target.lastPathComponent)")
             return target
         } catch {
-            NSLog("WorkTimeLaps: couldn't move unreadable \(url.lastPathComponent) aside: \(error.localizedDescription)")
+            AppLog.error("couldn't move unreadable \(url.lastPathComponent) aside: \(error.localizedDescription)")
             return nil
         }
     }

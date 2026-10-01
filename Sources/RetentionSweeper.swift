@@ -68,11 +68,11 @@ enum RetentionSweeper {
                 try fm.removeItem(at: url)
                 deleted += 1
             } catch {
-                NSLog("WorkTimeLaps: couldn't delete expired \(name): \(error.localizedDescription)")
+                AppLog.error("couldn't delete expired \(name): \(error.localizedDescription)")
             }
         }
         if deleted > 0 {
-            NSLog("WorkTimeLaps: deleted \(deleted) video file(s) older than \(retentionHours) h")
+            AppLog.notice("deleted \(deleted) video file(s) older than \(retentionHours) h")
         }
         return deleted
     }

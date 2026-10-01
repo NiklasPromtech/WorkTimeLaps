@@ -6,6 +6,7 @@ CoreTests.run()
 HighlightsTests.run()
 DiaryTests.run()
 PlanTests.run()
+VideoWriterTests.run()
 
 print("\n\(testCount) tests, \(testFailures) failure\(testFailures == 1 ? "" : "s")")
 exit(testFailures == 0 ? 0 : 1)

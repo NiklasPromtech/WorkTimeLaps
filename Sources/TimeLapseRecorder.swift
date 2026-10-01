@@ -85,7 +85,7 @@ final class TimeLapseRecorder {
     /// Screen Recording denials surface as ScreenCaptureKit's "user
     /// declined" error; anything else is a genuine capture failure.
     private static func captureError(_ error: Error) -> RecorderError {
-        NSLog("WorkTimeLaps: screen capture unavailable: \(error.localizedDescription)")
+        AppLog.notice("screen capture unavailable: \(error.localizedDescription)")
         if let scError = error as? SCStreamError, scError.code == .userDeclined {
             return .permissionDenied
         }
@@ -141,10 +141,10 @@ final class TimeLapseRecorder {
     }
 
     /// Movie fragments keep a video that was cut short by a crash or power
-    /// loss playable up to the last fragment. One fragment per ~5 minutes of
-    /// real time, expressed in video time.
-    private var movieFragmentInterval: CMTime {
-        let frames = max(1, Int((300 / captureInterval).rounded()))
+    /// loss playable up to the last fragment: one per ~5 minutes of real
+    /// time, and never fewer than 5 frames.
+    nonisolated static func movieFragmentInterval(captureInterval: TimeInterval, playbackFPS: Int32) -> CMTime {
+        let frames = max(5, Int((300 / captureInterval).rounded()))
         return CMTime(value: CMTimeValue(frames), timescale: playbackFPS)
     }
 
@@ -168,6 +168,22 @@ final class TimeLapseRecorder {
 
     /// Set while the user has paused recording from the menu.
     private(set) var userPauseUntil: Date?
+
+    /// When a frame was last saved to the log.
+    private(set) var lastSavedFrameAt: Date?
+
+    /// Since when recording has been on and not paused; nil while paused.
+    private var unpausedSince: Date?
+    private var lastRecoveryAttempt: Date?
+
+    /// Set when recording is on and not paused, but nothing has been saved
+    /// for several intervals. The menu shows this rather than looking fine
+    /// while frames are being lost.
+    var stalledSince: Date? {
+        guard isRecording, pauseReason == nil, let since = unpausedSince else { return nil }
+        let reference = max(since, lastSavedFrameAt ?? since)
+        return Date().timeIntervalSince(reference) > captureInterval * 3 + 60 ? reference : nil
+    }
 
     /// Called on the main actor after each frame is appended.
     var onFrameAppended: (@MainActor () -> Void)?
@@ -268,6 +284,9 @@ final class TimeLapseRecorder {
         try await prepareCapture()
         captureInterval = TimeInterval(Preferences.captureIntervalSeconds)
         resetSessionState()
+        lastSavedFrameAt = nil
+        unpausedSince = nil
+        lastRecoveryAttempt = nil
         userPauseUntil = nil
         isRecording = true
         SystemStateMonitor.shared.start()
@@ -357,8 +376,11 @@ final class TimeLapseRecorder {
             }
 
             if pauseReason == nil {
+                if unpausedSince == nil { unpausedSince = tickStart }
+                await recoverIfStalled(now: tickStart)
                 await captureOneFrame()
             } else {
+                unpausedSince = nil
                 flushSidecar()
             }
 
@@ -371,6 +393,25 @@ final class TimeLapseRecorder {
             } catch {
                 break  // CancellationError — stop() was called.
             }
+        }
+    }
+
+    /// When nothing has been saved for several intervals while recording,
+    /// starts over with a fresh display configuration and a fresh video. At
+    /// most once every ten minutes.
+    private func recoverIfStalled(now: Date) async {
+        guard let since = stalledSince else { return }
+        if let last = lastRecoveryAttempt, now.timeIntervalSince(last) < 600 { return }
+        lastRecoveryAttempt = now
+        AppLog.error("no frame saved since \(since); restarting capture")
+        postStateChange()
+        if session != nil {
+            await finishSession()
+        }
+        do {
+            try await prepareCapture()
+        } catch {
+            AppLog.error("couldn't restart capture: \(error.localizedDescription)")
         }
     }
 
@@ -407,7 +448,7 @@ final class TimeLapseRecorder {
         do {
             image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
         } catch {
-            NSLog("WorkTimeLaps: capture failed: \(error.localizedDescription)")
+            AppLog.error("capture failed: \(error.localizedDescription)")
             return
         }
 
@@ -423,7 +464,7 @@ final class TimeLapseRecorder {
                 try initializeWriter(width: image.width, height: image.height)
                 writerInitialized = true
             } catch {
-                NSLog("WorkTimeLaps: writer init failed: \(error.localizedDescription)")
+                AppLog.error("writer init failed: \(error.localizedDescription)")
                 return
             }
         }
@@ -470,7 +511,7 @@ final class TimeLapseRecorder {
             case .analyzed(let a):
                 analysis = a
             case .failed(let reason):
-                NSLog("WorkTimeLaps: analyzer failed (\(reason)) — redacting frame")
+                AppLog.error("analyzer failed (\(reason)) — redacting frame")
                 analyzerFailure = reason
             }
         }
@@ -546,7 +587,7 @@ final class TimeLapseRecorder {
         if isRedacted {
             // Never fall back to the real image for a redacted frame.
             guard let placeholder = RedactedFrame.image(width: image.width, height: image.height) else {
-                NSLog("WorkTimeLaps: couldn't render redaction placeholder — dropping frame")
+                AppLog.error("couldn't render redaction placeholder — dropping frame")
                 return
             }
             frameToWrite = placeholder
@@ -566,14 +607,30 @@ final class TimeLapseRecorder {
             smoothed = Int(next.rounded())
         }
 
-        guard let appendedIndex = appendFrame(frameToWrite) else {
-            // Writer couldn't take the frame — skip the log entry too.
-            return
+        var videoIndex = appendFrame(frameToWrite)
+        if videoIndex == nil, writer?.status == .failed {
+            // The video writer died. Close this video (its frame log and
+            // journal entry are kept) and carry on in a new one, rather than
+            // dropping every frame for the rest of the day.
+            AppLog.error("video writer failed (\(writer?.error?.localizedDescription ?? "unknown error")); continuing in a new video")
+            await finishSession()
+            guard isRecording else { return }
+            openSession(at: now, width: image.width, height: image.height)
+            do {
+                try initializeWriter(width: image.width, height: image.height)
+                writerInitialized = true
+                videoIndex = appendFrame(frameToWrite)
+            } catch {
+                AppLog.error("couldn't start a new video: \(error.localizedDescription)")
+            }
         }
+        // The activity log matters more than the video: a frame the video
+        // couldn't take is still logged, with index -1.
+        let appendedIndex = videoIndex ?? -1
 
         // Thumbnail from the first frame that isn't redacted, so the preview
         // never shows something the video hides.
-        if !thumbnailSaved && !isRedacted {
+        if !thumbnailSaved && !isRedacted && videoIndex != nil {
             saveThumbnail(frameToWrite)
             thumbnailSaved = true
         }
@@ -587,6 +644,7 @@ final class TimeLapseRecorder {
         currentCategory = category
         currentSummary = summaryText
         lastFrameAt = now
+        lastSavedFrameAt = now
         lastActivity = activityText.isEmpty ? nil : activityText
         lastSummaryForPrompt = summaryText.isEmpty ? nil : summaryText
         lastCategoryForPrompt = category
@@ -630,7 +688,7 @@ final class TimeLapseRecorder {
                 activity: activityText.isEmpty ? nil : activityText,
                 category: category,
                 sessionID: session?.id,
-                frameIndex: appendedIndex
+                frameIndex: videoIndex
             ))
         }
 
@@ -686,7 +744,7 @@ final class TimeLapseRecorder {
             if writer.status == .completed {
                 videoURL = outputURL
             } else {
-                NSLog("WorkTimeLaps: video finalize failed: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
+                AppLog.error("video finalize failed: \(writer.error?.localizedDescription ?? "status \(writer.status.rawValue)")")
             }
         } else {
             writer?.cancelWriting()
@@ -753,20 +811,40 @@ final class TimeLapseRecorder {
         }
         try? FileManager.default.removeItem(at: url)
 
+        let parts = try Self.makeVideoWriter(url: url, width: width, height: height,
+                                             captureInterval: captureInterval,
+                                             playbackFPS: playbackFPS, bitrate: videoBitrate)
+        self.writer = parts.writer
+        self.writerInput = parts.input
+        self.adaptor = parts.adaptor
+    }
+
+    /// Creates and starts the H.264 writer for one session's video. Static so
+    /// the tests exercise the exact configuration the app records with.
+    ///
+    /// Frame reordering (B-frames) is off. It saves nothing when frames are
+    /// a minute apart, and combined with short movie fragments it made
+    /// AVAssetWriter fail (-11800 / -16341) a few frames in, after which
+    /// every frame was dropped for the rest of the day.
+    nonisolated static func makeVideoWriter(url: URL, width: Int, height: Int,
+                                            captureInterval: TimeInterval, playbackFPS: Int32,
+                                            bitrate: Int) throws
+        -> (writer: AVAssetWriter, input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor) {
         let writer: AVAssetWriter
         do {
             writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         } catch {
             throw RecorderError.writerFailed(error.localizedDescription)
         }
-        writer.movieFragmentInterval = movieFragmentInterval
+        writer.movieFragmentInterval = movieFragmentInterval(captureInterval: captureInterval,
+                                                             playbackFPS: playbackFPS)
 
-        // H.264 — broadly compatible. Keyframe every 4 seconds of video so
-        // scrubbing stays responsive.
+        // Keyframe every 4 seconds of video so scrubbing stays responsive.
         let compressionSettings: [String: Any] = [
-            AVVideoAverageBitRateKey: videoBitrate,
+            AVVideoAverageBitRateKey: bitrate,
             AVVideoExpectedSourceFrameRateKey: Int(playbackFPS),
-            AVVideoMaxKeyFrameIntervalKey: Int(playbackFPS) * 4
+            AVVideoMaxKeyFrameIntervalKey: Int(playbackFPS) * 4,
+            AVVideoAllowFrameReorderingKey: false
         ]
         let settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -795,10 +873,7 @@ final class TimeLapseRecorder {
             throw RecorderError.writerFailed(writer.error?.localizedDescription ?? "startWriting failed")
         }
         writer.startSession(atSourceTime: .zero)
-
-        self.writer = writer
-        self.writerInput = input
-        self.adaptor = adaptor
+        return (writer, input, adaptor)
     }
 
     /// Returns the index of the appended frame, or nil if the writer wasn't
@@ -807,19 +882,22 @@ final class TimeLapseRecorder {
         guard let adaptor = adaptor, let input = writerInput else { return nil }
 
         guard input.isReadyForMoreMediaData else {
-            NSLog("WorkTimeLaps: writer not ready, dropping frame")
+            AppLog.error("writer not ready, dropping frame")
             return nil
         }
 
         guard let buffer = PixelBufferHelper.make(from: image,
                                                   width: image.width,
                                                   height: image.height,
-                                                  pool: adaptor.pixelBufferPool) else { return nil }
+                                                  pool: adaptor.pixelBufferPool) else {
+            AppLog.error("couldn't create a pixel buffer, dropping frame from the video")
+            return nil
+        }
 
         let appendedIndex = frameIndex
         let time = CMTime(value: frameIndex, timescale: playbackFPS)
         guard adaptor.append(buffer, withPresentationTime: time) else {
-            NSLog("WorkTimeLaps: append failed: \(writer?.error?.localizedDescription ?? "unknown")")
+            AppLog.error("append failed: \(writer?.error?.localizedDescription ?? "unknown")")
             return nil
         }
         frameIndex += 1
@@ -869,7 +947,7 @@ final class TimeLapseRecorder {
             try SessionWriter.write(s, to: url)
             framesSinceFlush = 0
         } catch {
-            NSLog("WorkTimeLaps: sidecar write failed: \(error.localizedDescription)")
+            AppLog.error("sidecar write failed: \(error.localizedDescription)")
         }
     }
 }

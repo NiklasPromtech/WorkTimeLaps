@@ -83,7 +83,7 @@ enum Journal {
         case .missing:
             log = DayLog(date: key, sessions: [])
         case .unreadable(let error):
-            NSLog("WorkTimeLaps: day log \(key) is unreadable (\(error.localizedDescription))")
+            AppLog.error("day log \(key) is unreadable (\(error.localizedDescription))")
             JSONFile.quarantine(url)
             log = DayLog(date: key, sessions: [])
         }
@@ -117,7 +117,7 @@ enum Journal {
             try JSONFile.write(log, to: url)
             postUpdate()
         } catch {
-            NSLog("WorkTimeLaps: failed to append journal for \(key): \(error.localizedDescription)")
+            AppLog.error("failed to append journal for \(key): \(error.localizedDescription)")
         }
     }
 
@@ -164,7 +164,7 @@ enum Journal {
             postUpdate()
             return true
         } catch {
-            NSLog("WorkTimeLaps: failed to write note for \(sessionID): \(error.localizedDescription)")
+            AppLog.error("failed to write note for \(sessionID): \(error.localizedDescription)")
             return false
         }
     }
@@ -230,9 +230,9 @@ enum SessionRecovery {
                 try SessionWriter.write(session, to: url)
                 Journal.append(session: session)
                 recovered += 1
-                NSLog("WorkTimeLaps: recovered unfinished session \(session.id) (\(session.frames.count) frames)")
+                AppLog.notice("recovered unfinished session \(session.id) (\(session.frames.count) frames)")
             } catch {
-                NSLog("WorkTimeLaps: couldn't recover \(session.id): \(error.localizedDescription)")
+                AppLog.error("couldn't recover \(session.id): \(error.localizedDescription)")
             }
         }
         return recovered

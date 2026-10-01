@@ -129,7 +129,7 @@ enum FollowUpStore {
         do {
             try JSONFile.write(items.sorted { $0.since < $1.since }, to: fileURL)
         } catch {
-            NSLog("WorkTimeLaps: couldn't save follow-ups: \(error.localizedDescription)")
+            AppLog.error("couldn't save follow-ups: \(error.localizedDescription)")
         }
         DiaryStore.postUpdate()
     }

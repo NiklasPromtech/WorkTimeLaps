@@ -173,6 +173,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             statusLine.title = needsScreenPermission ? "Not recording — needs Screen Recording access" : "Not recording\(todayText)"
         } else if let pause {
             statusLine.title = pause.label
+        } else if let stalled = recorder.stalledSince {
+            statusLine.title = "Recording, but nothing saved since \(DiaryFormat.time(stalled)) — retrying"
         } else {
             statusLine.title = "Recording\(todayText)"
         }
@@ -222,11 +224,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func updateIcon(pause: TimeLapseRecorder.PauseReason?) {
         guard let button = statusItem.button else { return }
+        let stalled = recorder.stalledSince != nil
         let symbol: String
         if !recorder.isRecording {
             symbol = "record.circle"
         } else if pause != nil {
             symbol = "pause.circle"
+        } else if stalled {
+            symbol = "exclamationmark.circle"
         } else {
             symbol = "record.circle.fill"
         }
@@ -236,7 +241,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             button.imagePosition = .imageLeading
         }
 
-        if recorder.isRecording, pause == nil, let e = recorder.currentEngagement {
+        if recorder.isRecording, pause == nil, !stalled, let e = recorder.currentEngagement {
             let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .semibold)
             button.attributedTitle = NSAttributedString(string: String(format: " %d", e), attributes: [
                 .font: font,
@@ -273,7 +278,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 if userInitiated { presentPermissionAlert() }
             } catch {
                 if userInitiated { presentError(error) }
-                NSLog("WorkTimeLaps: couldn't start recording: \(error.localizedDescription)")
+                AppLog.error("couldn't start recording: \(error.localizedDescription)")
             }
             isStarting = false
             refresh()
@@ -458,7 +463,7 @@ enum ScreenAccess {
         do {
             try reopen.run()
         } catch {
-            NSLog("WorkTimeLaps: couldn't schedule relaunch: \(error.localizedDescription)")
+            AppLog.error("couldn't schedule relaunch: \(error.localizedDescription)")
             return
         }
         NSApp.terminate(nil)

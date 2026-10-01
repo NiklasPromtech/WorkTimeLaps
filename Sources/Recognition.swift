@@ -177,7 +177,7 @@ enum RecognitionStore {
             existing = entries
         case .unreadable(let error):
             // Never replace an unreadable history with a one-entry list.
-            NSLog("WorkTimeLaps: recognitions.json is unreadable (\(error.localizedDescription))")
+            AppLog.error("recognitions.json is unreadable (\(error.localizedDescription))")
             JSONFile.quarantine(fileURL)
             existing = []
         }
@@ -193,7 +193,7 @@ enum RecognitionStore {
             try write(existing)
             postUpdate()
         } catch {
-            NSLog("WorkTimeLaps: recognition append failed: \(error.localizedDescription)")
+            AppLog.error("recognition append failed: \(error.localizedDescription)")
         }
     }
 
@@ -313,7 +313,7 @@ enum RecognitionStore {
             postUpdate()
             return true
         } catch {
-            NSLog("WorkTimeLaps: recognition remove failed: \(error.localizedDescription)")
+            AppLog.error("recognition remove failed: \(error.localizedDescription)")
             return false
         }
     }

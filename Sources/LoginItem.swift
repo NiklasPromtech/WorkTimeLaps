@@ -27,7 +27,7 @@ enum LoginItem {
             }
             return true
         } catch {
-            NSLog("WorkTimeLaps: couldn't \(enabled ? "register" : "unregister") login item: \(error.localizedDescription)")
+            AppLog.error("couldn't \(enabled ? "register" : "unregister") login item: \(error.localizedDescription)")
             return false
         }
     }
