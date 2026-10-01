@@ -169,6 +169,21 @@ enum Journal {
         }
     }
 
+    /// Time of the newest frame in any session log on disk.
+    static func lastRecordedFrameTime() -> Date? {
+        let folder = TimeLapseRecorder.recordingsFolder
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        func modified(_ url: URL) -> Date {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+        }
+        let newest = urls
+            .filter { $0.lastPathComponent.hasPrefix("TimeLapse_") && $0.pathExtension == "json" }
+            .max { modified($0) < modified($1) }
+        guard let newest, let session = try? SessionWriter.read(from: newest) else { return nil }
+        return session.frames.last?.t
+    }
+
     /// Sidecar JSON (frame-level data) for a digest: `<stem>.json`.
     static func sidecarURL(for digest: DayLog.SessionDigest) -> URL {
         let stem = (digest.video as NSString).deletingPathExtension

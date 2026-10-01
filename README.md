@@ -99,7 +99,7 @@ Once access is granted, recording starts on its own; if it doesn't, choose **Qui
 
 ## Using it
 
-The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The shortcuts below work while the menu is open.
+The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The menu shows when the last screenshot was saved, and warns if recording is on but nothing has been saved for a while. The shortcuts below work while the menu is open.
 
 - **Stop / Start Recording**, and **Pause** for 15 minutes, an hour, or until tomorrow.
 - **Daily Brief…** (⌘D) opens the most recent brief. Tick off follow-ups as you handle them. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.

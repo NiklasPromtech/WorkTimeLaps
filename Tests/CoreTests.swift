@@ -152,6 +152,21 @@ enum CoreTests {
 
         suite("Journal and recovery")
 
+        test("the newest frame on disk is found for the menu") {
+            resetDataDir()
+            expect(Journal.lastRecordedFrameTime() == nil)
+            writeSession(id: "TimeLapse_older", frames: frames(from: date(2026, 9, 29, 9), count: 3))
+            writeSession(id: "TimeLapse_newer", frames: frames(from: date(2026, 9, 30, 14), count: 4))
+            expectEqual(Journal.lastRecordedFrameTime(), date(2026, 9, 30, 14).addingTimeInterval(30))
+        }
+
+        test("the menu's relative times read naturally") {
+            let now = date(2026, 10, 1, 9, 30)
+            expectEqual(MenuBarController.relative(now.addingTimeInterval(-20), now: now), "just now")
+            expectEqual(MenuBarController.relative(now.addingTimeInterval(-4 * 60), now: now), "4 min ago")
+            expectEqual(MenuBarController.relative(now.addingTimeInterval(-3 * 3600), now: now), "3 h ago")
+        }
+
         test("sessions are filed under the work day they started in") {
             resetDataDir()
             writeSession(id: "TimeLapse_late", frames: frames(from: date(2026, 9, 30, 1, 0), count: 6))

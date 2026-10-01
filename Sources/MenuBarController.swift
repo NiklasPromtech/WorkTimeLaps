@@ -21,6 +21,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     private var statusLine: NSMenuItem!
     private var detailLine: NSMenuItem!
+    private var lastShotLine: NSMenuItem!
+
+    /// Newest frame on disk at launch, so the menu can say when the last
+    /// screenshot was saved before this run has saved one.
+    private var lastFrameOnDisk: Date?
     private var permissionItem: NSMenuItem!
     private var relaunchItem: NSMenuItem!
     private var startStopItem: NSMenuItem!
@@ -50,6 +55,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         buildMenu()
         configureAnalyzer()
         JournalStore.shared.recorder = recorder
+        lastFrameOnDisk = Journal.lastRecordedFrameTime()
 
         recorder.onFrameAppended = { [weak self] in
             self?.refresh()
@@ -81,6 +87,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         statusLine = NSMenuItem(title: "Not recording", action: nil, keyEquivalent: "")
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+
+        lastShotLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        lastShotLine.isEnabled = false
+        lastShotLine.isHidden = true
+        menu.addItem(lastShotLine)
 
         detailLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         detailLine.isEnabled = false
@@ -194,6 +205,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             detailLine.isHidden = true
         }
 
+        // When the last screenshot was saved: a quick way to check that
+        // recording really is working.
+        if let last = recorder.lastSavedFrameAt ?? lastFrameOnDisk {
+            lastShotLine.title = "Last screenshot \(DiaryFormat.time(last)) · \(Self.relative(last))"
+            lastShotLine.isHidden = false
+        } else {
+            lastShotLine.isHidden = true
+        }
+
         permissionItem.isHidden = !needsScreenPermission || recorder.isRecording
         relaunchItem.isHidden = permissionItem.isHidden
 
@@ -208,6 +228,17 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         resumeItem.isHidden = !userPaused
 
         updateIcon(pause: pause)
+    }
+
+    /// "just now", "4 min ago", "3 h ago", or the date for older ones.
+    nonisolated static func relative(_ date: Date, now: Date = Date()) -> String {
+        let seconds = now.timeIntervalSince(date)
+        if seconds < 60 { return "just now" }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes) min ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours) h ago" }
+        return DiaryFormat.shortDate(date)
     }
 
     // MARK: - Icon
