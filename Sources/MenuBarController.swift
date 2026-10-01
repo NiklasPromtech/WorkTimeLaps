@@ -22,6 +22,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private var statusLine: NSMenuItem!
     private var detailLine: NSMenuItem!
     private var lastShotLine: NSMenuItem!
+    private var screensLine: NSMenuItem!
 
     /// Newest frame on disk at launch, so the menu can say when the last
     /// screenshot was saved before this run has saved one.
@@ -92,6 +93,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         lastShotLine.isEnabled = false
         lastShotLine.isHidden = true
         menu.addItem(lastShotLine)
+
+        screensLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        screensLine.isEnabled = false
+        screensLine.isHidden = true
+        menu.addItem(screensLine)
 
         detailLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         detailLine.isEnabled = false
@@ -207,11 +213,27 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         // When the last screenshot was saved: a quick way to check that
         // recording really is working.
+        let screenCount = NSScreen.screens.count
         if let last = recorder.lastSavedFrameAt ?? lastFrameOnDisk {
-            lastShotLine.title = "Last screenshot \(DiaryFormat.time(last)) · \(Self.relative(last))"
+            var title = "Last screenshot \(DiaryFormat.time(last)) · \(Self.relative(last))"
+            // With several screens, say which one it was.
+            if screenCount > 1, recorder.lastSavedFrameAt != nil,
+               let id = recorder.lastCapturedDisplayID, let name = Screens.currentNames()[id] {
+                title += " · \(name)"
+            }
+            lastShotLine.title = title
             lastShotLine.isHidden = false
         } else {
             lastShotLine.isHidden = true
+        }
+
+        if screenCount > 1 && recorder.isRecording {
+            screensLine.title = Preferences.captureFollowsFocus
+                ? "Following your focus across \(screenCount) screens"
+                : "Capturing the main screen only (1 of \(screenCount))"
+            screensLine.isHidden = false
+        } else {
+            screensLine.isHidden = true
         }
 
         permissionItem.isHidden = !needsScreenPermission || recorder.isRecording

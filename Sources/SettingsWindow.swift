@@ -51,6 +51,14 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    var captureFollowsFocus: Bool {
+        get { Preferences.captureFollowsFocus }
+        set {
+            objectWillChange.send()
+            Preferences.captureFollowsFocus = newValue
+        }
+    }
+
     var retentionHours: Int {
         get { RetentionSweeper.retentionHours }
         set {
@@ -323,6 +331,24 @@ private struct RecordingSettings: View {
             }
             .padding(.top, 4)
             Text(intervalCaption)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 12) {
+                Text("With several screens")
+                Picker("With several screens", selection: Binding(
+                    get: { model.captureFollowsFocus },
+                    set: { model.captureFollowsFocus = $0 }
+                )) {
+                    Text("Follow my focus").tag(true)
+                    Text("Main screen only").tag(false)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            .padding(.top, 4)
+            Text("Each screenshot is of one screen: the one with the window you're working in, or the main screen. The cost is the same either way.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

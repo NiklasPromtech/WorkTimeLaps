@@ -99,13 +99,13 @@ Once access is granted, recording starts on its own; if it doesn't, choose **Qui
 
 ## Using it
 
-The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The menu shows when the last screenshot was saved, and warns if recording is on but nothing has been saved for a while. The shortcuts below work while the menu is open.
+The ◉ icon in the menu bar fills in while recording, with a live engagement number (grey, blue, orange, red — an effort tachometer, not a productivity score). The menu shows when the last screenshot was saved and from which screen, and warns if recording is on but nothing has been saved for a while. The shortcuts below work while the menu is open.
 
 - **Stop / Start Recording**, and **Pause** for 15 minutes, an hour, or until tomorrow.
 - **Daily Brief…** (⌘D) opens the most recent brief. Tick off follow-ups as you handle them. Days from the last three days get an entry automatically; for older days, click **Write it now**. **Rewrite** asks Claude for a fresh take; **Copy** puts the Markdown on the clipboard.
 - **Journal…** (⌘J) shows the week, each day's sessions, and per-session playback.
 - **Highlights…** (⌘H) collects the praise you've received over 7, 30 or 90 days, or the year.
-- **Settings…** (⌘,) has the login item, how often to take a screenshot, video retention, the day cutoff, the diary notification time, the API key, privacy filters and the block list.
+- **Settings…** (⌘,) has the login item, how often to take a screenshot, which screen to capture, video retention, the day cutoff, the diary notification time, the API key, privacy filters and the block list.
 
 ## Where things are stored
 
@@ -177,7 +177,7 @@ Handy while developing: `open --env WORKTIMELAPS_DATA_DIR=/tmp/wtl WorkTimeLaps.
 
 ## Limitations
 
-- Records the main display only.
+- With several screens, each screenshot is of one screen: the one with the window you're working in (or only the main screen, if you prefer). Something you're only reading on another screen, without clicking in it, isn't captured.
 - Built from source and not notarized — see the signing notes above.
 - Frame labels come from a model looking at screenshots, so they're sometimes vague or wrong. The diary is told to trust patterns over single frames, but read it as a draft of your day, not a record.
 - Follow-ups and meetings are only noticed when they're on screen as a screenshot is taken. At one a minute, a message you glance at for a few seconds can be missed, and replies you get by phone or in person are invisible — tick those off yourself.

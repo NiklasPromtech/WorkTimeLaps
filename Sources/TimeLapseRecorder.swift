@@ -238,9 +238,17 @@ final class TimeLapseRecorder {
 
     private var captureTask: Task<Void, Never>?
 
-    // ScreenCaptureKit — resolved once on start, reused per frame.
-    private var captureFilter: SCContentFilter?
-    private var captureConfig: SCStreamConfiguration?
+    // ScreenCaptureKit displays, looked up on start and again whenever the
+    // screen setup changes.
+    private var scDisplays: [CGDirectDisplayID: SCDisplay] = [:]
+    private var displaysNeedRefresh = false
+    private var screenObserver: NSObjectProtocol?
+
+    /// The screen the last saved frame came from.
+    private(set) var lastCapturedDisplayID: CGDirectDisplayID?
+
+    /// Frame size of the current session's video.
+    private var videoSize = (width: 0, height: 0)
 
     // AVAssetWriter pipeline for the current session.
     private var writer: AVAssetWriter?
@@ -281,6 +289,13 @@ final class TimeLapseRecorder {
 
     func start() async throws {
         guard !isRecording else { throw RecorderError.alreadyRecording }
+        if screenObserver == nil {
+            screenObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.displaysNeedRefresh = true }
+            }
+        }
         try await prepareCapture()
         captureInterval = TimeInterval(Preferences.captureIntervalSeconds)
         resetSessionState()
@@ -329,36 +344,68 @@ final class TimeLapseRecorder {
     // MARK: - Setup
 
     private func prepareCapture() async throws {
-        // Resolve displays via SCK. Throws if Screen Recording permission
-        // has been denied.
+        try await refreshDisplays()
+        guard let main = scDisplays[CGMainDisplayID()] ?? scDisplays.values.first else {
+            throw RecorderError.screenUnavailable(underlying: "no displays reported")
+        }
+        // Test shot so permission errors surface here, not silently later.
+        do {
+            _ = try await SCScreenshotManager.captureImage(contentFilter: Self.filter(for: main),
+                                                           configuration: configuration(for: main))
+        } catch {
+            throw Self.captureError(error)
+        }
+    }
+
+    /// Looks up the connected displays. Throws if Screen Recording permission
+    /// has been denied.
+    private func refreshDisplays() async throws {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.current
         } catch {
             throw Self.captureError(error)
         }
-        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-                ?? content.displays.first else {
+        guard !content.displays.isEmpty else {
             throw RecorderError.screenUnavailable(underlying: "no displays reported")
         }
+        scDisplays = Dictionary(content.displays.map { ($0.displayID, $0) }, uniquingKeysWith: { first, _ in first })
+        displaysNeedRefresh = false
+    }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+    private static func filter(for display: SCDisplay) -> SCContentFilter {
+        SCContentFilter(display: display, excludingWindows: [])
+    }
+
+    private func configuration(for display: SCDisplay) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = display.width
         config.height = display.height
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = true
         config.minimumFrameInterval = CMTime(value: 1, timescale: playbackFPS)
+        return config
+    }
 
-        // Test shot so permission errors surface here, not silently later.
-        do {
-            _ = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        } catch {
-            throw Self.captureError(error)
-        }
+    /// The screen to capture now: the one with the window you're working in
+    /// (or under the pointer), or the main screen if focus following is off.
+    private func displayToCapture(_ context: WorkContext) -> SCDisplay? {
+        let main = CGMainDisplayID()
+        let id = Preferences.captureFollowsFocus
+            ? Screens.focusedDisplay(window: context.windowBounds, mouse: Screens.mouseLocation,
+                                     displays: Screens.activeDisplays(), main: main)
+            : main
+        return scDisplays[id] ?? scDisplays[main] ?? scDisplays.values.first
+    }
 
-        captureFilter = filter
-        captureConfig = config
+    /// Frame size for a new session's video. When following focus, every
+    /// screen fits in it; frames from smaller or differently shaped screens
+    /// get black bars instead of being stretched.
+    private func canvasSize() -> (width: Int, height: Int) {
+        let displays = Preferences.captureFollowsFocus
+            ? Array(scDisplays.values)
+            : [scDisplays[CGMainDisplayID()] ?? scDisplays.values.first].compactMap { $0 }
+        return Screens.canvasSize(for: displays.map { CGSize(width: $0.width, height: $0.height) })
     }
 
     // MARK: - Capture loop
@@ -438,17 +485,31 @@ final class TimeLapseRecorder {
     }
 
     private func captureOneFrame() async {
-        guard isRecording, let filter = captureFilter, let config = captureConfig else { return }
+        guard isRecording else { return }
+        if displaysNeedRefresh || scDisplays.isEmpty {
+            do {
+                try await refreshDisplays()
+            } catch {
+                AppLog.error("couldn't look up displays: \(error.localizedDescription)")
+            }
+        }
 
         // Sample the foreground context *before* the screenshot so the rule
-        // check lines up with the captured pixels.
+        // check lines up with the captured pixels — and so we know which
+        // screen you're working on.
         let workContext = WorkContextProbe.current()
+        guard let display = displayToCapture(workContext) else {
+            AppLog.error("no display to capture")
+            return
+        }
 
         let image: CGImage
         do {
-            image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            image = try await SCScreenshotManager.captureImage(contentFilter: Self.filter(for: display),
+                                                               configuration: configuration(for: display))
         } catch {
             AppLog.error("capture failed: \(error.localizedDescription)")
+            displaysNeedRefresh = true
             return
         }
 
@@ -457,11 +518,12 @@ final class TimeLapseRecorder {
 
         let now = Date()
         if session == nil {
-            openSession(at: now, width: image.width, height: image.height)
+            let canvas = canvasSize()
+            openSession(at: now, width: canvas.width, height: canvas.height)
         }
-        if !writerInitialized {
+        if !writerInitialized, let size = session?.display {
             do {
-                try initializeWriter(width: image.width, height: image.height)
+                try initializeWriter(width: size.width, height: size.height)
                 writerInitialized = true
             } catch {
                 AppLog.error("writer init failed: \(error.localizedDescription)")
@@ -586,7 +648,7 @@ final class TimeLapseRecorder {
         let frameToWrite: CGImage
         if isRedacted {
             // Never fall back to the real image for a redacted frame.
-            guard let placeholder = RedactedFrame.image(width: image.width, height: image.height) else {
+            guard let placeholder = RedactedFrame.image(width: videoSize.width, height: videoSize.height) else {
                 AppLog.error("couldn't render redaction placeholder — dropping frame")
                 return
             }
@@ -615,9 +677,10 @@ final class TimeLapseRecorder {
             AppLog.error("video writer failed (\(writer?.error?.localizedDescription ?? "unknown error")); continuing in a new video")
             await finishSession()
             guard isRecording else { return }
-            openSession(at: now, width: image.width, height: image.height)
+            let canvas = canvasSize()
+            openSession(at: now, width: canvas.width, height: canvas.height)
             do {
-                try initializeWriter(width: image.width, height: image.height)
+                try initializeWriter(width: canvas.width, height: canvas.height)
                 writerInitialized = true
                 videoIndex = appendFrame(frameToWrite)
             } catch {
@@ -645,6 +708,7 @@ final class TimeLapseRecorder {
         currentSummary = summaryText
         lastFrameAt = now
         lastSavedFrameAt = now
+        lastCapturedDisplayID = display.displayID
         lastActivity = activityText.isEmpty ? nil : activityText
         lastSummaryForPrompt = summaryText.isEmpty ? nil : summaryText
         lastCategoryForPrompt = category
@@ -817,6 +881,7 @@ final class TimeLapseRecorder {
         self.writer = parts.writer
         self.writerInput = parts.input
         self.adaptor = parts.adaptor
+        self.videoSize = (width, height)
     }
 
     /// Creates and starts the H.264 writer for one session's video. Static so
@@ -887,8 +952,8 @@ final class TimeLapseRecorder {
         }
 
         guard let buffer = PixelBufferHelper.make(from: image,
-                                                  width: image.width,
-                                                  height: image.height,
+                                                  width: videoSize.width,
+                                                  height: videoSize.height,
                                                   pool: adaptor.pixelBufferPool) else {
             AppLog.error("couldn't create a pixel buffer, dropping frame from the video")
             return nil

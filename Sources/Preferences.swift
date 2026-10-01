@@ -14,6 +14,7 @@ enum Preferences {
         static let diaryWithClaude = "WorkTimeLaps.writeDiaryWithClaude"
         static let captureInterval = "WorkTimeLaps.captureIntervalSeconds"
         static let planning = "WorkTimeLaps.noticeFollowUpsAndMeetings"
+        static let followFocus = "WorkTimeLaps.captureFollowsFocus"
     }
 
     private static var defaults: UserDefaults { .standard }
@@ -57,6 +58,14 @@ enum Preferences {
     static var noticeFollowUpsAndMeetings: Bool {
         get { defaults.object(forKey: Key.planning) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.planning) }
+    }
+
+    /// With several screens, capture the one with the window you're working
+    /// in rather than always the main screen. One screen per screenshot
+    /// either way, so the cost is the same.
+    static var captureFollowsFocus: Bool {
+        get { defaults.object(forKey: Key.followFocus) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.followFocus) }
     }
 
     // MARK: - Capture interval

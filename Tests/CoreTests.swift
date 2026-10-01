@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 enum CoreTests {
 
@@ -148,6 +149,54 @@ enum CoreTests {
             expectEqual(deleted, 2)
             let remaining = Set(try fm.contentsOfDirectory(atPath: dataDir.path))
             expectEqual(remaining, ["TimeLapse_old.json", "TimeLapse_new.mp4", "TimeLapse_live.mp4", "holiday.mp4"])
+        }
+
+        suite("Screens")
+
+        // Your setup: two 1920×1080 screens either side of a 1728×1117 laptop.
+        let laptop: CGDirectDisplayID = 1, left: CGDirectDisplayID = 2, right: CGDirectDisplayID = 3
+        let layout: [CGDirectDisplayID: CGRect] = [
+            laptop: CGRect(x: 0, y: 0, width: 1728, height: 1117),
+            left: CGRect(x: -1920, y: 0, width: 1920, height: 1080),
+            right: CGRect(x: 1728, y: 0, width: 1920, height: 1080)
+        ]
+
+        test("the screen with the active window is the one captured") {
+            let chrome = CGRect(x: -1800, y: 40, width: 1500, height: 900)
+            expectEqual(Screens.focusedDisplay(window: chrome, mouse: nil, displays: layout, main: laptop), left)
+            // A window straddling two screens belongs to the one showing more of it.
+            let straddling = CGRect(x: 1500, y: 100, width: 1200, height: 600)
+            expectEqual(Screens.focusedDisplay(window: straddling, mouse: nil, displays: layout, main: laptop), right)
+        }
+
+        test("without a window, the screen under the pointer, then the main screen") {
+            expectEqual(Screens.focusedDisplay(window: nil, mouse: CGPoint(x: 2500, y: 500), displays: layout, main: laptop), right)
+            expectEqual(Screens.focusedDisplay(window: nil, mouse: nil, displays: layout, main: laptop), laptop)
+            let offscreen = CGRect(x: 9000, y: 9000, width: 10, height: 10)
+            expectEqual(Screens.focusedDisplay(window: offscreen, mouse: nil, displays: layout, main: laptop), laptop)
+        }
+
+        test("identical screens are told apart by position") {
+            let names = Screens.displayNames([
+                .init(id: laptop, name: "Built-in Retina Display", bounds: layout[laptop]!),
+                .init(id: left, name: "S17", bounds: layout[left]!),
+                .init(id: right, name: "S17", bounds: layout[right]!)
+            ], main: laptop)
+            expectEqual(names[laptop], "Built-in Retina Display")
+            expectEqual(names[left], "S17 (left)")
+            expectEqual(names[right], "S17 (right)")
+        }
+
+        test("one video frame fits every screen without stretching") {
+            let canvas = Screens.canvasSize(for: [CGSize(width: 1728, height: 1117), CGSize(width: 1920, height: 1080)])
+            expectEqual(canvas.width, 1920)
+            expectEqual(canvas.height, 1118)
+            let laptopFit = Screens.aspectFitRect(CGSize(width: 1728, height: 1117), in: CGSize(width: 1920, height: 1118))
+            expectEqual(laptopFit.height, 1118)
+            expect(laptopFit.minX > 0 && abs(laptopFit.midX - 960) <= 1, "laptop frame isn't centered: \(laptopFit)")
+            let monitorFit = Screens.aspectFitRect(CGSize(width: 1920, height: 1080), in: CGSize(width: 1920, height: 1118))
+            expectEqual(monitorFit.width, 1920)
+            expectEqual(monitorFit.minY, 19)
         }
 
         suite("Journal and recovery")

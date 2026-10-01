@@ -53,9 +53,13 @@ enum PixelBufferHelper {
                                   space: colorSpace,
                                   bitmapInfo: bitmapInfo) else { return nil }
 
-        // If the captured image differs in size from the target buffer, this
-        // stretches it to fit — matches what a QuickTime export would do.
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        // Screens of different sizes share one video: the image is fitted
+        // inside the frame without stretching, with black bars around it.
+        ctx.setFillColor(CGColor(gray: 0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: Screens.aspectFitRect(CGSize(width: image.width, height: image.height),
+                                                  in: CGSize(width: width, height: height)))
 
         return pb
     }
